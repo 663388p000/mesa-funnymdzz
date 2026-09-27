@@ -127,7 +127,8 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
    if (batch->fb.desc.cpu &&
        (cmdbuf->cur_batch->vtc_jc.first_tiler ||
-        cmdbuf->state.gfx.render.fb.needs_store)) {
+     cmdbuf->cur_batch->vtc_jc.first_job ||   // اضافه‌شده برای تست
+     cmdbuf->state.gfx.render.fb.needs_store)) {
       panvk_per_arch(cmd_select_tile_size)(cmdbuf);
 
       /* At this point, we should know sample count and the tile size should
