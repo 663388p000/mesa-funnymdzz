@@ -600,7 +600,10 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
                    atom_number, jc, evt.event_code);
          return false;
       }
-
+      /* DEBUG: direct read right after kernel says DONE, before any pool-specific invalidate */
+          pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+          mesa_logw("panvk DEBUG: raw job status @0x%" PRIx64 " = 0x%02x",
+          jc, *(volatile uint8_t *)(uintptr_t)jc);
       return true;
    }
 }
