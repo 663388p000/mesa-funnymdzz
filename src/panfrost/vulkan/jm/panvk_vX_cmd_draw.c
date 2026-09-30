@@ -41,6 +41,8 @@
 #include "vk_meta.h"
 #include "vk_pipeline_layout.h"
 
+#if PAN_ARCH < 9
+
 struct panvk_draw_data {
    struct panvk_draw_info info;
    unsigned vertex_range;
@@ -1058,7 +1060,7 @@ panvk_draw_prepare_tiler_job(struct panvk_cmd_buffer *cmdbuf,
                              struct panvk_draw_data *draw)
 {
    struct panvk_batch *batch = cmdbuf->cur_batch;
-   struct pan_ptr ptr;
+   struct pan_ptr ptr = {0};
 
    if (cmdbuf->state.gfx.fs.required) {
       const struct panvk_shader_desc_info *fs_desc_info =
@@ -1078,6 +1080,9 @@ panvk_draw_prepare_tiler_job(struct panvk_cmd_buffer *cmdbuf,
    draw->jobs.frag_copy_desc = ptr;
 
    ptr = panvk_cmd_alloc_desc(cmdbuf, TILER_JOB);
+   if (!ptr.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
    util_dynarray_append(&batch->jobs, ptr.cpu);
    draw->jobs.tiler = ptr;
 
@@ -1446,7 +1451,8 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
 static void
 panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
 {
-   const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_variant *vs =
+      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
    VkResult result;
 
    /* If there's no vertex shader, we can skip the draw. */
@@ -1518,7 +1524,8 @@ static void
 panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
                         struct panvk_draw_data *draw)
 {
-   const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_variant *vs =
+      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
    VkResult result;
 
    /* If there's no vertex shader, we can skip the draw. */
@@ -1901,6 +1908,53 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
 
    panvk_cmd_draw_indirect(cmdbuf, &draw);
 }
+
+#else /* PAN_ARCH >= 9 */
+
+/* TODO(v9): port the draw path to Valhall descriptors (DEPTH_STENCIL/BLEND/
+ * SHADER_PROGRAM instead of RENDERER_STATE, new job layout, no
+ * ATTRIBUTE_BUFFER). Until then fail cleanly instead of emitting bad jobs. */
+static void
+panvk_draw_unsupported_v9(VkCommandBuffer commandBuffer)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,
+                        uint32_t instanceCount, uint32_t firstVertex,
+                        uint32_t firstInstance)
+{
+   panvk_draw_unsupported_v9(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
+                               uint32_t indexCount, uint32_t instanceCount,
+                               uint32_t firstIndex, int32_t vertexOffset,
+                               uint32_t firstInstance)
+{
+   panvk_draw_unsupported_v9(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
+                                VkDeviceSize offset, uint32_t drawCount,
+                                uint32_t stride)
+{
+   panvk_draw_unsupported_v9(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
+                                       VkBuffer _buffer, VkDeviceSize offset,
+                                       uint32_t drawCount, uint32_t stride)
+{
+   panvk_draw_unsupported_v9(commandBuffer);
+}
+
+#endif /* PAN_ARCH < 9 */
 
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdBeginRendering)(VkCommandBuffer commandBuffer,
