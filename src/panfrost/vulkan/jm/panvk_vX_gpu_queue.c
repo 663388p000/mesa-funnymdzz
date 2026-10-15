@@ -116,6 +116,26 @@
  * the default, equally-real kbase behaviour and hasn't been shown to
  * need overriding on this device.
  *
+ * IMPORTANT #3 -- seq_nr is a *group* id, and each atom kind sets it by
+ * its own rule: base_jd_atom::seq_nr is documented as the "sequence
+ * number of logical grouping of atoms". An earlier revision copied
+ * atom_number into it, which does not fit that meaning: atom_number is
+ * 1..255 and wraps, and the vertex/tiler atom and the fragment atom of
+ * one batch (one logical group) ended up with two unrelated values.
+ * The rules now (see panvk_kbase_seq_nr_assign()):
+ *   - VERTEX_TILER (a batch's vtc_jc chain: vertex/tiler, and also the
+ *     compute/WRITE_VALUE/NULL jobs panvk puts in that same chain --
+ *     there is no separate compute atom kind): always opens a new group
+ *     -> a fresh seq_nr from a per-queue, strictly increasing counter.
+ *   - FRAGMENT (a batch's frag_jc chain): joins the group opened by the
+ *     *same batch's* vertex/tiler atom (same seq_nr); a batch that has
+ *     only a fragment chain opens a group of its own.
+ * seq_nr is 64-bit, starts at 1, is never 0 and is never reused on a
+ * queue. PANVK_KBASE_SEQ_NR=group|atom|zero switches the rule at run
+ * time (default group; atom = the old "mirror atom_number" behaviour;
+ * zero = no seq_nr at all, like a v2 atom) to A/B-test on a device
+ * whether seq_nr has any effect on a given kernel without rebuilding.
+ *
  *   - KBASE_IOCTL_VERSION_CHECK   = _IOWR(0x80, 0, {u16 major, u16 minor})
  *   - KBASE_IOCTL_JOB_SUBMIT      = _IOW (0x80, 2, {u64 addr, u32 nr_atoms, u32 stride})
  *   - struct base_jd_atom   (v3, 64 bytes, see layout below) -- what we submit
@@ -186,7 +206,8 @@ struct panvk_kbase_dependency {
  * this order, so no __attribute__((packed)) is needed on either aarch64
  * or x86_64. */
 struct panvk_kbase_atom {
-   uint64_t seq_nr;                        /* offset 0  */
+   uint64_t seq_nr;                        /* offset 0: logical-group id, see
+                                            * panvk_kbase_seq_nr_assign() */
    uint64_t jc;                            /* offset 8  */
    uint64_t udata[2];                      /* offset 16 (base_jd_udata) */
    uint64_t extres_list;                   /* offset 32 */
@@ -398,9 +419,117 @@ struct panvk_kbase_event_v2 {
 /* --------------------------------------------------------------------- */
 
 enum panvk_kbase_atom_kind {
+   /* A batch's vtc_jc chain: vertex + tiler jobs, plus any compute /
+    * WRITE_VALUE / NULL jobs panvk puts in that same chain (compute
+    * dispatches ride in vtc_jc, so there is no separate compute kind). */
    PANVK_KBASE_ATOM_VERTEX_TILER,
+   /* A batch's frag_jc chain. */
    PANVK_KBASE_ATOM_FRAGMENT,
 };
+
+static const char *
+panvk_kbase_atom_kind_name(enum panvk_kbase_atom_kind kind)
+{
+   switch (kind) {
+   case PANVK_KBASE_ATOM_VERTEX_TILER:
+      return "vertex/tiler";
+   case PANVK_KBASE_ATOM_FRAGMENT:
+      return "fragment";
+   }
+   UNREACHABLE("bad panvk_kbase_atom_kind");
+}
+
+/* The only core_req bits this file ever issues, one case per atom kind.
+ * The kernel's job scheduler derives the job slot from these alone. */
+static uint32_t
+panvk_kbase_core_req_for_kind(enum panvk_kbase_atom_kind kind)
+{
+   switch (kind) {
+   case PANVK_KBASE_ATOM_VERTEX_TILER:
+      return PANVK_KBASE_JD_REQ_CS | PANVK_KBASE_JD_REQ_T;
+   case PANVK_KBASE_ATOM_FRAGMENT:
+      return PANVK_KBASE_JD_REQ_FS;
+   }
+   UNREACHABLE("bad panvk_kbase_atom_kind");
+}
+
+/* One panvk_batch == one logical group of atoms for base_jd_atom::seq_nr.
+ * Lives on the stack of panvk_queue_submit_batch() and is handed to every
+ * atom that batch submits, so that the atoms of one batch can share a
+ * seq_nr while the next batch (or the next submission of the same batch)
+ * gets a new one. */
+struct panvk_kbase_atom_group {
+   /* 0 until the first atom of the batch has been submitted. */
+   uint64_t seq_nr;
+};
+
+enum panvk_kbase_seq_nr_mode {
+   PANVK_KBASE_SEQ_NR_GROUP, /* default: per-batch group id */
+   PANVK_KBASE_SEQ_NR_ATOM,  /* legacy: mirror atom_number (wraps at 255) */
+   PANVK_KBASE_SEQ_NR_ZERO,  /* no seq_nr at all, like a v2 atom */
+};
+
+/* PANVK_KBASE_SEQ_NR=group|atom|zero, read once. Only meant for A/B
+ * testing on a device whether seq_nr influences anything on the kernel
+ * being run against; "group" is the correct, default behaviour. */
+static enum panvk_kbase_seq_nr_mode
+panvk_kbase_seq_nr_mode(void)
+{
+   static int cached = -1; /* -1: not yet computed */
+
+   if (cached >= 0)
+      return (enum panvk_kbase_seq_nr_mode)cached;
+
+   enum panvk_kbase_seq_nr_mode mode = PANVK_KBASE_SEQ_NR_GROUP;
+   const char *env = os_get_option("PANVK_KBASE_SEQ_NR");
+   if (env && env[0]) {
+      if (!strcmp(env, "group"))
+         mode = PANVK_KBASE_SEQ_NR_GROUP;
+      else if (!strcmp(env, "atom"))
+         mode = PANVK_KBASE_SEQ_NR_ATOM;
+      else if (!strcmp(env, "zero"))
+         mode = PANVK_KBASE_SEQ_NR_ZERO;
+      else
+         mesa_logw("panvk: ignoring invalid PANVK_KBASE_SEQ_NR=%s "
+                   "(expected group, atom or zero)", env);
+   }
+
+   cached = (int)mode;
+   return mode;
+}
+
+/* Pick the seq_nr for the next atom of `group`, with a separate rule for
+ * each atom kind:
+ *
+ *  - VERTEX_TILER: always the first atom of a batch -> opens a new group,
+ *    i.e. takes a fresh number from the queue's strictly increasing
+ *    counter. (If a batch ever submitted a second vertex/tiler atom it
+ *    would open another group, never silently reuse the old number.)
+ *
+ *  - FRAGMENT: runs after the same batch's vertex/tiler atom -> joins that
+ *    group and reuses its seq_nr. A batch with no vertex/tiler chain at
+ *    all (fragment only) has no group yet, so it opens its own.
+ *
+ * The counter is per queue and 64-bit, starts at 1 (0 is never handed out)
+ * and is never reused, even if the submit ioctl later fails. */
+static uint64_t
+panvk_kbase_seq_nr_assign(struct panvk_gpu_queue *queue,
+                          struct panvk_kbase_atom_group *group,
+                          enum panvk_kbase_atom_kind kind)
+{
+   switch (kind) {
+   case PANVK_KBASE_ATOM_VERTEX_TILER:
+      group->seq_nr = ++queue->jm_seq_nr;
+      break;
+
+   case PANVK_KBASE_ATOM_FRAGMENT:
+      if (group->seq_nr == 0)
+         group->seq_nr = ++queue->jm_seq_nr;
+      break;
+   }
+
+   return group->seq_nr;
+}
 
 /* Upper bound on how long we'll wait for a single JM atom to complete
  * before giving up and declaring the device lost, instead of blocking
@@ -438,6 +567,10 @@ panvk_kbase_atom_timeout_ns(void)
  * inside this function for why that, not a pre_dep, is what actually
  * orders a batch's fragment atom after its vertex/tiler atom.
  *
+ * `group` is the calling batch's seq_nr bookkeeping: this function takes
+ * the atom's seq_nr from it according to `kind` (see
+ * panvk_kbase_seq_nr_assign()).
+ *
  * See the big comment on panvk_gpu_queue::jm_last_atom for why this is
  * synchronous instead of returning a fence-like object: completion is
  * only observable by draining a shared poll()+read() base_jd_event_v2
@@ -446,6 +579,7 @@ panvk_kbase_atom_timeout_ns(void)
  */
 static bool
 panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
+                           struct panvk_kbase_atom_group *group,
                            enum panvk_kbase_atom_kind kind, uint64_t jc)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
@@ -465,14 +599,26 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
     * this file doesn't request a specific slot (PANVK_KBASE_JD_REQ_JOB_SLOT
     * stays unset; see the correction note on the `jobslot` struct
     * field above for why that's a choice, not an ABI limitation). */
-   uint32_t core_req = kind == PANVK_KBASE_ATOM_FRAGMENT
-                           ? PANVK_KBASE_JD_REQ_FS
-                           : (PANVK_KBASE_JD_REQ_CS | PANVK_KBASE_JD_REQ_T);
+   uint32_t core_req = panvk_kbase_core_req_for_kind(kind);
+
+   /* seq_nr: one rule per atom kind (see panvk_kbase_seq_nr_assign()).
+    * The assign call always runs, so the queue's counter and the batch's
+    * group advance the same way whatever PANVK_KBASE_SEQ_NR is set to;
+    * the env knob only overrides the value that goes into the atom. */
+   uint64_t seq_nr = panvk_kbase_seq_nr_assign(queue, group, kind);
+   switch (panvk_kbase_seq_nr_mode()) {
+   case PANVK_KBASE_SEQ_NR_GROUP:
+      break;
+   case PANVK_KBASE_SEQ_NR_ATOM:
+      seq_nr = atom_number;
+      break;
+   case PANVK_KBASE_SEQ_NR_ZERO:
+      seq_nr = 0;
+      break;
+   }
 
    struct panvk_kbase_atom atom = {
-      /* No logical grouping of atoms beyond ordinary pre_dep chaining,
-       * so seq_nr just mirrors atom_number. */
-      .seq_nr = atom_number,
+      .seq_nr = seq_nr,
       .jc = jc,
       .core_req = core_req,
       .atom_number = atom_number,
@@ -527,6 +673,11 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       .nr_atoms = 1,
       .stride = sizeof(atom),
    };
+
+   mesa_logd("panvk: kbase JM submit: %s atom_number=%u seq_nr=%" PRIu64
+             " core_req=0x%x jc=0x%" PRIx64,
+             panvk_kbase_atom_kind_name(kind), atom_number, seq_nr, core_req,
+             jc);
 
    if (ioctl(fd, PANVK_KBASE_IOCTL_JOB_SUBMIT, &submit)) {
       mesa_loge("panvk: KBASE_IOCTL_JOB_SUBMIT failed: %s", strerror(errno));
@@ -617,6 +768,11 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
 
+   /* All atoms submitted below belong to this one batch, i.e. to one
+    * logical group for base_jd_atom::seq_nr. Created per *submission*,
+    * so re-submitting an already issued batch gets a new seq_nr too. */
+   struct panvk_kbase_atom_group group = {0};
+
    /* Reset the batch if it's already been issued */
    if (batch->issued) {
       util_dynarray_foreach(&batch->jobs, void *, job)
@@ -644,7 +800,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 
    if (batch->vtc_jc.first_job) {
       bool ok = panvk_queue_jm_submit_atom(
-         queue, PANVK_KBASE_ATOM_VERTEX_TILER, batch->vtc_jc.first_job);
+         queue, &group, PANVK_KBASE_ATOM_VERTEX_TILER,
+         batch->vtc_jc.first_job);
 
       /* Decode/abort-on-fault must NOT be skipped just because this atom
        * already failed -- that's exactly the case where the dump is
@@ -694,7 +851,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 
    if (batch->frag_jc.first_job) {
       bool ok = panvk_queue_jm_submit_atom(
-         queue, PANVK_KBASE_ATOM_FRAGMENT, batch->frag_jc.first_job);
+         queue, &group, PANVK_KBASE_ATOM_FRAGMENT, batch->frag_jc.first_job);
 
       if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) || !ok) {
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
