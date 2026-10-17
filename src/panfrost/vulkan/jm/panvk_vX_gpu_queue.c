@@ -116,26 +116,6 @@
  * the default, equally-real kbase behaviour and hasn't been shown to
  * need overriding on this device.
  *
- * IMPORTANT #3 -- seq_nr is a *group* id, and each atom kind sets it by
- * its own rule: base_jd_atom::seq_nr is documented as the "sequence
- * number of logical grouping of atoms". An earlier revision copied
- * atom_number into it, which does not fit that meaning: atom_number is
- * 1..255 and wraps, and the vertex/tiler atom and the fragment atom of
- * one batch (one logical group) ended up with two unrelated values.
- * The rules now (see panvk_kbase_seq_nr_assign()):
- *   - VERTEX_TILER (a batch's vtc_jc chain: vertex/tiler, and also the
- *     compute/WRITE_VALUE/NULL jobs panvk puts in that same chain --
- *     there is no separate compute atom kind): always opens a new group
- *     -> a fresh seq_nr from a per-queue, strictly increasing counter.
- *   - FRAGMENT (a batch's frag_jc chain): joins the group opened by the
- *     *same batch's* vertex/tiler atom (same seq_nr); a batch that has
- *     only a fragment chain opens a group of its own.
- * seq_nr is 64-bit, starts at 1, is never 0 and is never reused on a
- * queue. PANVK_KBASE_SEQ_NR=group|atom|zero switches the rule at run
- * time (default group; atom = the old "mirror atom_number" behaviour;
- * zero = no seq_nr at all, like a v2 atom) to A/B-test on a device
- * whether seq_nr has any effect on a given kernel without rebuilding.
- *
  *   - KBASE_IOCTL_VERSION_CHECK   = _IOWR(0x80, 0, {u16 major, u16 minor})
  *   - KBASE_IOCTL_JOB_SUBMIT      = _IOW (0x80, 2, {u64 addr, u32 nr_atoms, u32 stride})
  *   - struct base_jd_atom   (v3, 64 bytes, see layout below) -- what we submit
@@ -206,8 +186,7 @@ struct panvk_kbase_dependency {
  * this order, so no __attribute__((packed)) is needed on either aarch64
  * or x86_64. */
 struct panvk_kbase_atom {
-   uint64_t seq_nr;                        /* offset 0: logical-group id, see
-                                            * panvk_kbase_seq_nr_assign() */
+   uint64_t seq_nr;                        /* offset 0  */
    uint64_t jc;                            /* offset 8  */
    uint64_t udata[2];                      /* offset 16 (base_jd_udata) */
    uint64_t extres_list;                   /* offset 32 */
@@ -419,116 +398,105 @@ struct panvk_kbase_event_v2 {
 /* --------------------------------------------------------------------- */
 
 enum panvk_kbase_atom_kind {
-   /* A batch's vtc_jc chain: vertex + tiler jobs, plus any compute /
-    * WRITE_VALUE / NULL jobs panvk puts in that same chain (compute
-    * dispatches ride in vtc_jc, so there is no separate compute kind). */
    PANVK_KBASE_ATOM_VERTEX_TILER,
-   /* A batch's frag_jc chain. */
    PANVK_KBASE_ATOM_FRAGMENT,
 };
 
-static const char *
-panvk_kbase_atom_kind_name(enum panvk_kbase_atom_kind kind)
-{
-   switch (kind) {
-   case PANVK_KBASE_ATOM_VERTEX_TILER:
-      return "vertex/tiler";
-   case PANVK_KBASE_ATOM_FRAGMENT:
-      return "fragment";
-   }
-   UNREACHABLE("bad panvk_kbase_atom_kind");
-}
+/* kbase hands the atom's `udata` back verbatim in the completion event, so it
+ * is the one reliable way to tell *our* completion event from any other event
+ * on this fd (the `atom_number` echo has been reported to be unreliable, see
+ * the note in panvk_queue_jm_submit_atom()). High word: a tag; low word: a
+ * per-process submission counter. */
+#define PANVK_KBASE_EVT_COOKIE 0x504b564b00000000ull /* "PKVK" */
 
-/* The only core_req bits this file ever issues, one case per atom kind.
- * The kernel's job scheduler derives the job slot from these alone. */
-static uint32_t
-panvk_kbase_core_req_for_kind(enum panvk_kbase_atom_kind kind)
-{
-   switch (kind) {
-   case PANVK_KBASE_ATOM_VERTEX_TILER:
-      return PANVK_KBASE_JD_REQ_CS | PANVK_KBASE_JD_REQ_T;
-   case PANVK_KBASE_ATOM_FRAGMENT:
-      return PANVK_KBASE_JD_REQ_FS;
-   }
-   UNREACHABLE("bad panvk_kbase_atom_kind");
-}
+/* Job header word 0 is the exception status the job manager writes back when
+ * a job finishes: 1 == DONE (the convention pandecode_abort_on_fault()
+ * checks). The `next` pointer is in words 6/7 (see pan_jc.h). */
+#define PANVK_KBASE_JOB_STATUS_DONE 1u
+#define PANVK_KBASE_JOB_HDR_NEXT_OFFSET 24
 
-/* One panvk_batch == one logical group of atoms for base_jd_atom::seq_nr.
- * Lives on the stack of panvk_queue_submit_batch() and is handed to every
- * atom that batch submits, so that the atoms of one batch can share a
- * seq_nr while the next batch (or the next submission of the same batch)
- * gets a new one. */
-struct panvk_kbase_atom_group {
-   /* 0 until the first atom of the batch has been submitted. */
-   uint64_t seq_nr;
+struct panvk_kbase_ddk_version_req {
+   uint64_t version_buffer;
+   uint32_t size;
+   uint32_t padding;
+};
+#define PANVK_KBASE_IOCTL_GET_DDK_VERSION \
+   _IOW(PANVK_KBASE_IOCTL_TYPE, 13, struct panvk_kbase_ddk_version_req)
+
+/* Where the job headers live, i.e. what has to be invalidated in the CPU
+ * caches before the job manager's status write-back can be read. Both NULL
+ * means "uncached mapping, nothing to invalidate". */
+struct panvk_kbase_inval {
+   struct panvk_pool *pool;
+   struct panvk_priv_bo *bo;
 };
 
-enum panvk_kbase_seq_nr_mode {
-   PANVK_KBASE_SEQ_NR_GROUP, /* default: per-batch group id */
-   PANVK_KBASE_SEQ_NR_ATOM,  /* legacy: mirror atom_number (wraps at 255) */
-   PANVK_KBASE_SEQ_NR_ZERO,  /* no seq_nr at all, like a v2 atom */
-};
-
-/* PANVK_KBASE_SEQ_NR=group|atom|zero, read once. Only meant for A/B
- * testing on a device whether seq_nr influences anything on the kernel
- * being run against; "group" is the correct, default behaviour. */
-static enum panvk_kbase_seq_nr_mode
-panvk_kbase_seq_nr_mode(void)
+static bool
+panvk_kbase_env_flag(const char *name)
 {
-   static int cached = -1; /* -1: not yet computed */
-
-   if (cached >= 0)
-      return (enum panvk_kbase_seq_nr_mode)cached;
-
-   enum panvk_kbase_seq_nr_mode mode = PANVK_KBASE_SEQ_NR_GROUP;
-   const char *env = os_get_option("PANVK_KBASE_SEQ_NR");
-   if (env && env[0]) {
-      if (!strcmp(env, "group"))
-         mode = PANVK_KBASE_SEQ_NR_GROUP;
-      else if (!strcmp(env, "atom"))
-         mode = PANVK_KBASE_SEQ_NR_ATOM;
-      else if (!strcmp(env, "zero"))
-         mode = PANVK_KBASE_SEQ_NR_ZERO;
-      else
-         mesa_logw("panvk: ignoring invalid PANVK_KBASE_SEQ_NR=%s "
-                   "(expected group, atom or zero)", env);
-   }
-
-   cached = (int)mode;
-   return mode;
+   const char *v = os_get_option(name);
+   return v && v[0] && v[0] != '0';
 }
 
-/* Pick the seq_nr for the next atom of `group`, with a separate rule for
- * each atom kind:
- *
- *  - VERTEX_TILER: always the first atom of a batch -> opens a new group,
- *    i.e. takes a fresh number from the queue's strictly increasing
- *    counter. (If a batch ever submitted a second vertex/tiler atom it
- *    would open another group, never silently reuse the old number.)
- *
- *  - FRAGMENT: runs after the same batch's vertex/tiler atom -> joins that
- *    group and reuses its seq_nr. A batch with no vertex/tiler chain at
- *    all (fragment only) has no group yet, so it opens its own.
- *
- * The counter is per queue and 64-bit, starts at 1 (0 is never handed out)
- * and is never reused, even if the submit ioctl later fails. */
-static uint64_t
-panvk_kbase_seq_nr_assign(struct panvk_gpu_queue *queue,
-                          struct panvk_kbase_atom_group *group,
-                          enum panvk_kbase_atom_kind kind)
+/* Verify mode: don't take a DONE event at face value, also check the job
+ * headers. On with PANVK_DEBUG=trace/sync or PANVK_KBASE_VERIFY=1. */
+static bool
+panvk_kbase_verify_enabled(void)
 {
-   switch (kind) {
-   case PANVK_KBASE_ATOM_VERTEX_TILER:
-      group->seq_nr = ++queue->jm_seq_nr;
-      break;
+   return PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) ||
+          panvk_kbase_env_flag("PANVK_KBASE_VERIFY");
+}
 
-   case PANVK_KBASE_ATOM_FRAGMENT:
-      if (group->seq_nr == 0)
-         group->seq_nr = ++queue->jm_seq_nr;
-      break;
+/* Walk a job chain through its CPU mapping (GPU VA == CPU VA on kbase) and
+ * report the first job whose exception status isn't DONE. */
+static bool
+panvk_kbase_chain_done(uint64_t jc, uint64_t *bad_jc, uint32_t *bad_status)
+{
+   uint64_t cur = jc;
+
+   for (unsigned guard = 0; cur && guard < 4096; guard++) {
+      const volatile uint8_t *hdr = (const volatile uint8_t *)(uintptr_t)cur;
+      uint32_t status = *(const volatile uint32_t *)hdr;
+
+      if (status != PANVK_KBASE_JOB_STATUS_DONE) {
+         *bad_jc = cur;
+         *bad_status = status;
+         return false;
+      }
+
+      cur = *(const volatile uint64_t *)(hdr + PANVK_KBASE_JOB_HDR_NEXT_OFFSET);
    }
 
-   return group->seq_nr;
+   return true;
+}
+
+/* The job headers normally live in *cached* CPU mappings, so the job
+ * manager's status write-back is only visible after the CPU lines have been
+ * invalidated. Re-invalidate on every poll round: a stale line makes a
+ * finished job look unfinished. */
+static bool
+panvk_kbase_wait_chain_done(struct panvk_device *dev,
+                            const struct panvk_kbase_inval *inval,
+                            uint64_t jc, int wait_ms, uint64_t *bad_jc,
+                            uint32_t *bad_status)
+{
+   int64_t end_ns = os_time_get_nano() + (int64_t)wait_ms * 1000000ll;
+
+   for (;;) {
+      if (inval && inval->pool)
+         panvk_pool_invalidate_maps(inval->pool);
+      if (inval && inval->bo)
+         panvk_priv_bo_invalidate(inval->bo, 0, pan_kmod_bo_size(inval->bo->bo));
+      pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+
+      if (panvk_kbase_chain_done(jc, bad_jc, bad_status))
+         return true;
+
+      if (os_time_get_nano() >= end_ns)
+         return false;
+
+      usleep(1000);
+   }
 }
 
 /* Upper bound on how long we'll wait for a single JM atom to complete
@@ -567,10 +535,6 @@ panvk_kbase_atom_timeout_ns(void)
  * inside this function for why that, not a pre_dep, is what actually
  * orders a batch's fragment atom after its vertex/tiler atom.
  *
- * `group` is the calling batch's seq_nr bookkeeping: this function takes
- * the atom's seq_nr from it according to `kind` (see
- * panvk_kbase_seq_nr_assign()).
- *
  * See the big comment on panvk_gpu_queue::jm_last_atom for why this is
  * synchronous instead of returning a fence-like object: completion is
  * only observable by draining a shared poll()+read() base_jd_event_v2
@@ -579,11 +543,16 @@ panvk_kbase_atom_timeout_ns(void)
  */
 static bool
 panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
-                           struct panvk_kbase_atom_group *group,
-                           enum panvk_kbase_atom_kind kind, uint64_t jc)
+                           const struct panvk_kbase_inval *inval,
+                           enum panvk_kbase_atom_kind kind, uint64_t jc,
+                           bool force_verify, int64_t timeout_ns,
+                           bool *status_ok)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    int fd = dev->kmod.dev->fd;
+
+   if (status_ok)
+      *status_ok = false;
 
    /* Atom numbers are a u8 (BASE_JD_ATOM_COUNT == 256) and 0 is reserved
     * to mean "no dependency" in pre_dep, so cycle through 1..255. Since
@@ -599,26 +568,20 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
     * this file doesn't request a specific slot (PANVK_KBASE_JD_REQ_JOB_SLOT
     * stays unset; see the correction note on the `jobslot` struct
     * field above for why that's a choice, not an ABI limitation). */
-   uint32_t core_req = panvk_kbase_core_req_for_kind(kind);
+   uint32_t core_req = kind == PANVK_KBASE_ATOM_FRAGMENT
+                           ? PANVK_KBASE_JD_REQ_FS
+                           : (PANVK_KBASE_JD_REQ_CS | PANVK_KBASE_JD_REQ_T);
 
-   /* seq_nr: one rule per atom kind (see panvk_kbase_seq_nr_assign()).
-    * The assign call always runs, so the queue's counter and the batch's
-    * group advance the same way whatever PANVK_KBASE_SEQ_NR is set to;
-    * the env knob only overrides the value that goes into the atom. */
-   uint64_t seq_nr = panvk_kbase_seq_nr_assign(queue, group, kind);
-   switch (panvk_kbase_seq_nr_mode()) {
-   case PANVK_KBASE_SEQ_NR_GROUP:
-      break;
-   case PANVK_KBASE_SEQ_NR_ATOM:
-      seq_nr = atom_number;
-      break;
-   case PANVK_KBASE_SEQ_NR_ZERO:
-      seq_nr = 0;
-      break;
-   }
+   static uint32_t submit_seq;
+   const uint64_t cookie =
+      PANVK_KBASE_EVT_COOKIE |
+      (uint64_t)__atomic_add_fetch(&submit_seq, 1, __ATOMIC_RELAXED);
 
    struct panvk_kbase_atom atom = {
-      .seq_nr = seq_nr,
+      /* No logical grouping of atoms beyond ordinary pre_dep chaining,
+       * so seq_nr just mirrors atom_number. */
+      .seq_nr = atom_number,
+      .udata = {cookie, jc},
       .jc = jc,
       .core_req = core_req,
       .atom_number = atom_number,
@@ -674,10 +637,24 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       .stride = sizeof(atom),
    };
 
-   mesa_logd("panvk: kbase JM submit: %s atom_number=%u seq_nr=%" PRIu64
-             " core_req=0x%x jc=0x%" PRIx64,
-             panvk_kbase_atom_kind_name(kind), atom_number, seq_nr, core_req,
-             jc);
+   /* This queue is fully synchronous, so there must be no event waiting on
+    * the fd at this point. If there is one, it belongs to nothing we are
+    * about to submit: reading it as "our" completion would make every later
+    * submission consume the previous atom's event. Drain and report it. */
+   for (;;) {
+      struct pollfd stale_pfd = {.fd = fd, .events = POLLIN};
+      if (poll(&stale_pfd, 1, 0) <= 0 || !(stale_pfd.revents & POLLIN))
+         break;
+
+      struct panvk_kbase_event_v2 stale;
+      if (read(fd, &stale, sizeof(stale)) != (ssize_t)sizeof(stale))
+         break;
+
+      mesa_logw("panvk: discarding stale kbase event before submit: "
+                "code=0x%x atom=%u udata=0x%" PRIx64 ",0x%" PRIx64,
+                stale.event_code, stale.atom_number, stale.udata[0],
+                stale.udata[1]);
+   }
 
    if (ioctl(fd, PANVK_KBASE_IOCTL_JOB_SUBMIT, &submit)) {
       mesa_loge("panvk: KBASE_IOCTL_JOB_SUBMIT failed: %s", strerror(errno));
@@ -695,12 +672,29 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
     * events for other atom numbers can't turn this into an unbounded
     * wait -- this is what fixes vkQueueSubmit()/vkQueueWaitIdle() hanging
     * forever when a completion event never arrives. */
-   int64_t deadline_ns = os_time_get_nano() + panvk_kbase_atom_timeout_ns();
+   int64_t deadline_ns =
+      os_time_get_nano() +
+      (timeout_ns > 0 ? timeout_ns : panvk_kbase_atom_timeout_ns());
+
+   /* In verify mode a DONE event isn't taken at face value: the job headers
+    * must also show the hardware's DONE status. An event that doesn't line up
+    * with the headers is reported, and an unattributed one is skipped in
+    * favour of the next. */
+   const bool verify = force_verify || panvk_kbase_verify_enabled();
+   const char *wait_env = os_get_option("PANVK_KBASE_STATUS_WAIT_MS");
+   const int status_wait_ms = (wait_env && wait_env[0]) ? atoi(wait_env) : 200;
+   unsigned done_events = 0;
 
    for (;;) {
       int64_t now_ns = os_time_get_nano();
       int64_t remaining_ns = deadline_ns - now_ns;
       if (remaining_ns <= 0) {
+         if (done_events) {
+            mesa_logw("panvk: kbase atom %u: %u DONE event(s) seen but no job "
+                      "header ever reported DONE; trusting the kernel (see "
+                      "the warnings above)", atom_number, done_events);
+            return true;
+         }
          mesa_loge("panvk: timed out waiting for kbase JM atom %u (job "
                    "chain 0x%" PRIx64 ") to complete -- device is either "
                    "stuck or its watchdog didn't fire; treating this "
@@ -732,18 +726,35 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       if (n == 0 || (size_t)n < sizeof(evt))
          continue;
 
-      /* NOTE: this kernel/DDK does not echo back the atom_number we
-       * submitted (confirmed on-device: submitted atom_number=1, event
-       * came back with atom_number=0) -- so it cannot be used to match
-       * events to submissions. That's fine here: this queue only ever
-       * has exactly one atom outstanding at a time (fully synchronous,
-       * see the big comment above), so the first event we read after
-       * submitting is unambiguously the one we're waiting for,
-       * regardless of what its atom_number field says. */
-      if (evt.atom_number != atom_number)
-         mesa_logd("panvk: kbase JM event atom_number=%u != submitted "
-                   "atom_number=%u (expected quirk on this DDK, not an "
-                   "error)", evt.atom_number, atom_number);
+      /* Match the event to *this* atom by its udata cookie. An earlier
+       * revision of this file concluded from an on-device test that the DDK
+       * doesn't echo atom_number back (submitted 1, got 0) and accepted the
+       * first event it read, whatever it was. kbase reports the index of the
+       * atom slot, so that observation is suspect: an event for slot 0 means
+       * the kernel put the atom in slot 0, i.e. it did not read our
+       * atom_number -- and then it did not read core_req either, so it would
+       * treat the atom as a pure dependency atom that completes at once with
+       * DONE without ever touching the GPU. That matches "DONE, but the job
+       * header status never changes". udata is echoed verbatim, so use it
+       * to tell the cases apart; an all-zero udata is treated as
+       * "unattributed" (a kernel that doesn't echo it) and is still
+       * accepted unless the job headers contradict it. */
+      const bool ours = evt.udata[0] == cookie;
+      const bool unattributed = evt.udata[0] == 0 && evt.udata[1] == 0;
+
+      if (verify)
+         mesa_logw("panvk: kbase event: code=0x%x atom=%u (submitted %u) "
+                   "udata=0x%" PRIx64 ",0x%" PRIx64 " (sent 0x%" PRIx64
+                   ") -> %s",
+                   evt.event_code, evt.atom_number, atom_number,
+                   evt.udata[0], evt.udata[1], cookie,
+                   ours ? "ours" : unattributed ? "unattributed" : "foreign");
+
+      if (!ours && !unattributed) {
+         mesa_logw("panvk: ignoring kbase event that carries another cookie "
+                   "(code=0x%x atom=%u)", evt.event_code, evt.atom_number);
+         continue;
+      }
 
       if (evt.event_code != PANVK_KBASE_JD_EVENT_DONE) {
          mesa_loge("panvk: kbase JM atom %u (job chain 0x%" PRIx64
@@ -751,11 +762,169 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
                    atom_number, jc, evt.event_code);
          return false;
       }
-      /* DEBUG: direct read right after kernel says DONE, before any pool-specific invalidate */
-          pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
-          mesa_logw("panvk DEBUG: raw job status @0x%" PRIx64 " = 0x%02x",
-          jc, *(volatile uint8_t *)(uintptr_t)jc);
-      return true;
+
+      if (!verify)
+         return true;
+
+      done_events++;
+
+      uint64_t bad_jc = 0;
+      uint32_t bad_status = 0;
+      if (panvk_kbase_wait_chain_done(dev, inval, jc, status_wait_ms,
+                                      &bad_jc, &bad_status)) {
+         if (status_ok)
+            *status_ok = true;
+         mesa_logw("panvk: kbase atom %u: every job in chain 0x%" PRIx64
+                   " reports DONE", atom_number, jc);
+         return true;
+      }
+
+      mesa_logw("panvk: kbase reported DONE for atom %u (%s event) but job "
+                "0x%" PRIx64 " in chain 0x%" PRIx64 " still has "
+                "exception_status=0x%x after %d ms (CPU caches "
+                "invalidated). Either the atom never reached the GPU or "
+                "the GPU's write-back isn't visible to the CPU.",
+                atom_number, ours ? "matching" : "unattributed", bad_jc, jc,
+                bad_status, status_wait_ms);
+
+      if (ours)
+         return true; /* The kernel says our atom completed: believe it. */
+
+      /* Unattributed and contradicted by the headers: it may be a stray
+       * event, so give the real one a short grace period. */
+      int64_t grace_ns = os_time_get_nano() + 1000000000ll;
+      if (grace_ns < deadline_ns)
+         deadline_ns = grace_ns;
+   }
+}
+
+/* ------------------------------------------------------------------------
+ * Self-test: submit a NULL job through exactly the path real work takes and
+ * check that the job manager marks it DONE. Splits the possible failures:
+ *  - uncached buffer fails         -> the atom/submission path is broken
+ *  - only cached buffers fail      -> CPU<->GPU cache maintenance is broken
+ *  - everything passes             -> the draw job's own contents are suspect
+ * Runs once, in verify mode (or PANVK_KBASE_SELFTEST=1); PANVK_KBASE_SELFTEST=0
+ * disables it.
+ * ---------------------------------------------------------------------- */
+
+static void
+panvk_kbase_log_ddk_version(int fd)
+{
+   char buf[160] = {0};
+   struct panvk_kbase_ddk_version_req req = {
+      .version_buffer = (uintptr_t)buf,
+      .size = sizeof(buf) - 1,
+   };
+
+   if (ioctl(fd, PANVK_KBASE_IOCTL_GET_DDK_VERSION, &req) >= 0)
+      mesa_logw("panvk: kbase DDK version: \"%s\"", buf);
+   else
+      mesa_logw("panvk: KBASE_IOCTL_GET_DDK_VERSION failed: %s",
+                strerror(errno));
+}
+
+static bool
+panvk_kbase_selftest_run(struct panvk_gpu_queue *queue, bool cached,
+                         const char *what)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   struct panvk_priv_bo *bo = NULL;
+
+   VkResult res =
+      panvk_priv_bo_create(dev, 4096, cached ? PAN_KMOD_BO_FLAG_WB_MMAP : 0,
+                           VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &bo);
+   if (res != VK_SUCCESS || !bo->addr.host) {
+      mesa_logw("panvk: kbase self-test (%s): can't allocate a test BO", what);
+      if (res == VK_SUCCESS)
+         panvk_priv_bo_unref(bo);
+      return false;
+   }
+
+   memset(bo->addr.host, 0, 64);
+   pan_cast_and_pack(bo->addr.host, JOB_HEADER, header) {
+      header.type = MALI_JOB_TYPE_NULL;
+      header.index = 1;
+   }
+
+   if (cached) {
+      panvk_priv_bo_flush(bo, 0, 64);
+      pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+   }
+
+   const struct panvk_kbase_inval inval = {.bo = cached ? bo : NULL};
+   bool status_ok = false;
+   bool ok = panvk_queue_jm_submit_atom(queue, &inval,
+                                        PANVK_KBASE_ATOM_VERTEX_TILER,
+                                        bo->addr.dev, true, 2000000000ll,
+                                        &status_ok);
+
+   mesa_logw("panvk: kbase self-test (%s): atom %s, job header status %s",
+             what, ok ? "completed" : "FAILED",
+             status_ok ? "DONE" : "NOT updated");
+
+   panvk_priv_bo_unref(bo);
+   return ok && status_ok;
+}
+
+static void
+panvk_kbase_selftest(struct panvk_gpu_queue *queue)
+{
+   static uint32_t once;
+   const char *env = os_get_option("PANVK_KBASE_SELFTEST");
+
+   if (env && env[0] == '0')
+      return;
+   if (!panvk_kbase_verify_enabled() && !panvk_kbase_env_flag("PANVK_KBASE_SELFTEST"))
+      return;
+   if (__atomic_exchange_n(&once, 1, __ATOMIC_ACQ_REL))
+      return;
+
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   struct pan_kmod_dev *kdev = dev->kmod.dev;
+
+   panvk_kbase_log_ddk_version(kdev->fd);
+
+   if (!panvk_kbase_selftest_run(queue, false, "uncached CPU mapping")) {
+      mesa_logw("panvk: kbase self-test: a NULL job on an UNCACHED buffer is "
+                "not executed either, so the problem is the atom/submission "
+                "path itself (atom layout or core_req as the kernel reads "
+                "it, or kernel policy) -- not CPU caches and not the draw's "
+                "descriptors. Compare the event's atom/udata fields above "
+                "with what was submitted.");
+      return;
+   }
+
+   const uint32_t saved_flags = kdev->flags;
+   bool user_tested = false, user_ok = false;
+
+   kdev->flags &= ~PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL;
+   if (pan_kmod_can_sync_bo_map_from_userland(kdev)) {
+      user_tested = true;
+      user_ok = panvk_kbase_selftest_run(queue, true,
+                                         "cached mapping + EL0 cache ops");
+   }
+
+   kdev->flags |= PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL;
+   bool kernel_ok = panvk_kbase_selftest_run(
+      queue, true, "cached mapping + KBASE_IOCTL_MEM_SYNC");
+
+   kdev->flags = saved_flags;
+
+   if (user_tested && user_ok) {
+      mesa_logw("panvk: kbase self-test passed: atoms execute and CPU cache "
+                "maintenance works. If the draw still doesn't complete, the "
+                "problem is in the draw job's contents.");
+   } else if (kernel_ok) {
+      kdev->flags |= PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL;
+      mesa_logw("panvk: kbase self-test: %s -- switching to kernel-side "
+                "cache sync (KBASE_IOCTL_MEM_SYNC) for this process.",
+                user_tested ? "EL0 cache ops don't make GPU writes visible"
+                            : "no EL0 cache ops available");
+   } else {
+      mesa_logw("panvk: kbase self-test: cached mappings fail with both sync "
+                "methods while uncached ones work. Run with "
+                "PANVK_DEBUG=no_wb_mmap.");
    }
 }
 
@@ -767,11 +936,6 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
-
-   /* All atoms submitted below belong to this one batch, i.e. to one
-    * logical group for base_jd_atom::seq_nr. Created per *submission*,
-    * so re-submitting an already issued batch gets a new seq_nr too. */
-   struct panvk_kbase_atom_group group = {0};
 
    /* Reset the batch if it's already been issued */
    if (batch->issued) {
@@ -799,9 +963,10 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
    if (batch->vtc_jc.first_job) {
+      const struct panvk_kbase_inval inval = {.pool = &cmdbuf->desc_pool};
       bool ok = panvk_queue_jm_submit_atom(
-         queue, &group, PANVK_KBASE_ATOM_VERTEX_TILER,
-         batch->vtc_jc.first_job);
+         queue, &inval, PANVK_KBASE_ATOM_VERTEX_TILER,
+         batch->vtc_jc.first_job, false, 0, NULL);
 
       /* Decode/abort-on-fault must NOT be skipped just because this atom
        * already failed -- that's exactly the case where the dump is
@@ -836,7 +1001,9 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if ((PANVK_DEBUG(DUMP) || !ok) && dev->debug.decode_ctx)
          pandecode_dump_mappings(dev->debug.decode_ctx);
 
-      if ((PANVK_DEBUG(SYNC) || !ok) && dev->debug.decode_ctx)
+      if (((PANVK_DEBUG(SYNC) &&
+            !panvk_kbase_env_flag("PANVK_KBASE_NO_ABORT")) || !ok) &&
+          dev->debug.decode_ctx)
          pandecode_abort_on_fault(dev->debug.decode_ctx,
                                   batch->vtc_jc.first_job,
                                   phys_dev->kmod.dev->props.gpu_id);
@@ -850,8 +1017,10 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    }
 
    if (batch->frag_jc.first_job) {
+      const struct panvk_kbase_inval inval = {.pool = &cmdbuf->desc_pool};
       bool ok = panvk_queue_jm_submit_atom(
-         queue, &group, PANVK_KBASE_ATOM_FRAGMENT, batch->frag_jc.first_job);
+         queue, &inval, PANVK_KBASE_ATOM_FRAGMENT, batch->frag_jc.first_job,
+         false, 0, NULL);
 
       if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) || !ok) {
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
@@ -865,7 +1034,9 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if ((PANVK_DEBUG(DUMP) || !ok) && dev->debug.decode_ctx)
          pandecode_dump_mappings(dev->debug.decode_ctx);
 
-      if ((PANVK_DEBUG(SYNC) || !ok) && dev->debug.decode_ctx)
+      if (((PANVK_DEBUG(SYNC) &&
+            !panvk_kbase_env_flag("PANVK_KBASE_NO_ABORT")) || !ok) &&
+          dev->debug.decode_ctx)
          pandecode_abort_on_fault(dev->debug.decode_ctx,
                                   batch->frag_jc.first_job,
                                   phys_dev->kmod.dev->props.gpu_id);
@@ -966,6 +1137,8 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue,
       container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    VkResult result;
+
+   panvk_kbase_selftest(queue);
 
    /* A kbase atom's pre_dep can only chain onto prior atoms *on this same
     * queue*; there's no way to hand it an external semaphore as a
