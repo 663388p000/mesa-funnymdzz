@@ -92,6 +92,10 @@ panvk_can_present_on_device(VkPhysicalDevice pdevice, int fd)
  * silently dropped: the log shows only vertex+fragment atoms, never a
  * compute job, and the linear present buffer stayed all zeros.
  *
+ * Compute dispatch now exists on v9/JM (jm_emit_compute_job), so the blit
+ * path works too; linear stays the default because it is faster (no extra
+ * copy per frame) and has no dependency on compute at all.
+ *
  * Fix: ask WSI for a plain LINEAR, host-visible swapchain image that the
  * app renders into directly (no blit, no compute, no AFBC).  The
  * MESA_VK_WSI_DEBUG=linear switch is read inside wsi_device_init(), so it
