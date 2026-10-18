@@ -17,6 +17,7 @@
 #include "panvk_cmd_buffer.h"
 #include "panvk_cmd_desc_state.h"
 #include "panvk_cmd_precomp.h"
+#include "panvk_descriptor_set.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
 #include "panvk_macros.h"
@@ -27,6 +28,8 @@
 #include "pan_encoder.h"
 #include "pan_jc.h"
 #include "pan_props.h"
+
+#include "util/log.h"
 
 #include <vulkan/vulkan_core.h>
 
@@ -217,44 +220,176 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    panvk_per_arch(cmd_close_batch)(cmdbuf);
    clear_dirty_after_dispatch(cmdbuf);
 }
-#else
-/* TODO v9: compute dispatch not yet ported.
+#else /* PAN_ARCH >= 9 */
+/* Valhall + JM compute dispatch.
  *
- * The code above packs a COMPUTE_JOB DRAW section straight out of
- * panvk_shader_desc_state's Bifrost table layout (->tables[...],
- * ->img_attrib_table). At PAN_ARCH >= 9 that struct shape doesn't exist
- * (see panvk_cmd_desc_state.h) -- Valhall replaced the Renderer
- * State/Attribute Buffer/Invocation descriptors with the Shader-Program
- * (SPD) + Resource-table model, and the Compute Job section layout
- * changed with it, so this can't just be recompiled for v9.
+ * Valhall dropped the Bifrost RSD/attribute/UBO/texture/sampler tables: a
+ * compute job carries one SHADER_ENVIRONMENT (resource table, SPD, TSD, FAU)
+ * plus the workgroup size/count, exactly like the Gallium driver's
+ * PAN_ARCH >= 9 launch_grid path.  The resource table and driver set are
+ * built with the same CPU-only helpers the CSF backend (and this tree's v9
+ * graphics path) already use.
  *
- * The JM job-chain submission side (cmd_open_batch/cmd_close_batch,
- * pan_jc_add_job, batch->vtc_jc) stays exactly as above -- v9 is still
- * JM, only the descriptor model changed. The resource-table side has a
- * verified, submission-agnostic reference: csf/panvk_vX_cmd_dispatch.c's
- * prepare_driver_set() + panvk_per_arch(cmd_prepare_shader_res_table)()
- * already do this for CSF archs and don't touch cs_builder, so the same
- * two calls apply here unchanged (repeat_count=1, as CSF passes).
- *
- * What's missing is the v9 Compute Job/Compute Payload descriptor pack
- * itself. It is a distinct genxml struct, not a v9 SHADER_ENVIRONMENT
- * (that's what the graphics path in this same directory's
- * panvk_vX_cmd_draw.c uses for VS/FS) and not the old COMPUTE_JOB/DRAW
- * fields packed above -- that field layout
- * isn't evidenced anywhere in this source subset, so rather than guess
- * genxml field names for a job the GPU executes directly, this is left
- * unimplemented. Reference for the actual v9 compute job layout: the
- * Gallium/OpenGL ES Panfrost driver's pan_cmdstream.c already has a
- * working v9 compute path (src/gallium/drivers/panfrost/pan_cmdstream.c
- * upstream) -- that plus the real genxml/v9.xml is what this needs.
- *
- * Until then this is a clean no-op, matching how CmdDrawIndirect /
- * CmdDrawIndexedIndirect are stubbed for v9 elsewhere in this tree:
- * vkCmdDispatch* completes and signals normally, it just submits no GPU
- * job. Graphics (vkCmdDraw*) is unaffected. */
+ * Without this, every compute-based meta operation was silently dropped:
+ * vkCmdCopyBuffer, vkCmdCopyImageToBuffer, vkCmdFillBuffer, ... completed
+ * "successfully" and wrote nothing. */
+VkResult
+panvk_per_arch(jm_emit_compute_job)(
+   struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *cs,
+   const struct pan_compute_dim *dim, uint64_t res_table, uint64_t fau_ptr,
+   uint32_t fau_count, uint64_t tsd, bool barrier, bool suppress_prefetch,
+   unsigned local_dep, unsigned global_dep)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   assert(batch);
+
+   struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
+   if (!job.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   util_dynarray_append(&batch->jobs, job.cpu);
+
+   pan_section_pack(job.cpu, COMPUTE_JOB, PAYLOAD, cfg) {
+      cfg.workgroup_size_x = cs->cs.local_size.x;
+      cfg.workgroup_size_y = cs->cs.local_size.y;
+      cfg.workgroup_size_z = cs->cs.local_size.z;
+
+      cfg.workgroup_count_x = dim->x;
+      cfg.workgroup_count_y = dim->y;
+      cfg.workgroup_count_z = dim->z;
+
+      cfg.compute.resources = res_table;
+      cfg.compute.shader = panvk_priv_mem_dev_addr(cs->spd);
+      cfg.compute.thread_storage = tsd;
+      cfg.compute.fau = fau_ptr;
+      cfg.compute.fau_count = fau_count;
+
+      cfg.allow_merging_workgroups = cs->info.cs.allow_merging_workgroups;
+
+      /* One workgroup per task along Z: always valid, the hardware clamps
+       * the increment to the job size on that axis. */
+      cfg.task_increment = 1;
+      cfg.task_axis = MALI_TASK_AXIS_Z;
+   }
+
+   pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, barrier,
+                  suppress_prefetch, local_dep, global_dep, &job, false);
+   return VK_SUCCESS;
+}
+
+static VkResult
+prepare_cs_driver_set(struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct panvk_shader_desc_info *cs_desc_info =
+      &cmdbuf->state.compute.shader->desc_info;
+   const struct panvk_descriptor_state *desc_state =
+      &cmdbuf->state.compute.desc_state;
+   struct panvk_shader_desc_state *cs_desc_state =
+      &cmdbuf->state.compute.cs.desc;
+   uint32_t desc_count = cs_desc_info->dyn_bufs.count + 1;
+   struct pan_ptr driver_set = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, desc_count * PANVK_DESCRIPTOR_SIZE, PANVK_DESCRIPTOR_SIZE);
+   struct panvk_opaque_desc *descs = driver_set.cpu;
+
+   if (!driver_set.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   /* Dummy sampler always comes first. */
+   pan_cast_and_pack(&descs[0], SAMPLER, cfg) {
+      cfg.clamp_integer_array_indices = false;
+   }
+
+   panvk_per_arch(cmd_fill_dyn_bufs)(desc_state, cs_desc_info,
+                                     (struct mali_buffer_packed *)(&descs[1]));
+
+   cs_desc_state->driver_set.dev_addr = driver_set.gpu;
+   cs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+   return VK_SUCCESS;
+}
+
 static void
 cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
 {
+   const struct panvk_shader_variant *cs =
+      panvk_shader_only_variant(cmdbuf->state.compute.shader);
+   VkResult result;
+
+   /* If there's no compute shader, we can skip the dispatch. */
+   if (!panvk_priv_mem_check_alloc(cs->spd))
+      return;
+
+   const bool indirect = info->indirect.buffer_dev_addr != 0;
+   if (indirect) {
+      /* The indirect path patches the job's workgroup counts from a GPU
+       * kernel; that needs the v9 COMPUTE_JOB field offsets and is not
+       * wired up yet.  Say so once instead of failing silently. */
+      static bool warned;
+      if (!warned) {
+         warned = true;
+         mesa_logw("panvk: vkCmdDispatchIndirect is not implemented on "
+                   "Valhall/JM yet; dispatch skipped");
+      }
+      return;
+   }
+
+   panvk_per_arch(cmd_close_batch)(cmdbuf);
+   struct panvk_batch *batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
+   if (!batch)
+      return;
+
+   const struct panvk_shader_desc_info *cs_desc_info =
+      &cmdbuf->state.compute.shader->desc_info;
+   struct panvk_descriptor_state *desc_state =
+      &cmdbuf->state.compute.desc_state;
+   struct panvk_shader_desc_state *cs_desc_state =
+      &cmdbuf->state.compute.cs.desc;
+
+   struct pan_compute_dim dim = {
+      info->direct.wg_count.x,
+      info->direct.wg_count.y,
+      info->direct.wg_count.z,
+   };
+
+   uint64_t tsd =
+      panvk_per_arch(cmd_dispatch_prepare_tls)(cmdbuf, cs, &dim, false);
+   if (!tsd)
+      return;
+
+   /* The resource table lives in the *command buffer's* pools and a new
+    * batch was just opened, so always rebuild it rather than trusting the
+    * dirty bits left by a previous dispatch. */
+   result = panvk_per_arch(cmd_prepare_push_descs)(
+      cmdbuf, desc_state, cs_desc_info->used_set_mask);
+   if (result != VK_SUCCESS)
+      return;
+
+   panvk_per_arch(cmd_prepare_dispatch_sysvals)(cmdbuf, info);
+
+   result = prepare_cs_driver_set(cmdbuf);
+   if (result != VK_SUCCESS)
+      return;
+
+   struct pan_ptr push_uniforms;
+   result = panvk_per_arch(cmd_prepare_compute_push_uniforms)(
+      cmdbuf, cs, &push_uniforms);
+   if (result != VK_SUCCESS)
+      return;
+   cmdbuf->state.compute.push_uniforms = push_uniforms.gpu;
+
+   result = panvk_per_arch(cmd_prepare_shader_res_table)(
+      cmdbuf, desc_state, cs_desc_info, cs_desc_state, 1);
+   if (result != VK_SUCCESS)
+      return;
+
+   result = panvk_per_arch(jm_emit_compute_job)(
+      cmdbuf, cs, &dim, cs_desc_state->res_table,
+      cmdbuf->state.compute.push_uniforms, cs->fau.total_count, tsd,
+      false, false, 0, 0);
+   if (result != VK_SUCCESS)
+      return;
+
+   panvk_per_arch(cmd_close_batch)(cmdbuf);
+   clear_dirty_after_dispatch(cmdbuf);
 }
 #endif
 
