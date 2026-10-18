@@ -32,22 +32,35 @@
  * any other header in this translation unit defines. No external kbase
  * header is included.
  *
- * IMPORTANT -- atom struct is base_jd_atom (v3), NOT base_jd_atom_v2:
- * an earlier revision of this file submitted the 56-byte
- * base_jd_atom_v2 layout (no seq_nr) and every KBASE_IOCTL_JOB_SUBMIT
- * came back EINVAL. Confirmed on-device with a minimal standalone
- * ioctl test (UAPI negotiates as 11.46 on this kernel/DDK, i.e. the
- * "R54P1"-era job manager): switching the submitted struct to the
- * 64-byte layout with `seq_nr` as its first member (`jc` moves to
- * offset 8) made JOB_SUBMIT succeed immediately. That 64-byte/seq_nr
- * layout is exactly `struct base_jd_atom` in mali_base_jm_kernel.h
- * ("Same as base_jd_atom_v2, but has an extra seq_nr at the beginning"
- * + a trailing renderpass_id byte where v2 just has more padding) --
- * so this DDK's JOB_SUBMIT only accepts the v3 shape.
+ * IMPORTANT -- layout and stride are two different things on this DDK
+ * (r54p1, UAPI 11.46). The atom that the kernel parses is
+ * `struct base_jd_atom_v2`, byte for byte (56 bytes, `jc` at offset 0,
+ * `atom_number` at 40, `core_req` at 44) -- but KBASE_IOCTL_JOB_SUBMIT
+ * insists on `stride == 64`. An earlier revision of this file passed the
+ * 56-byte struct with stride 56, got EINVAL, and concluded that the
+ * kernel wants the 64-byte "v3" layout with `seq_nr` first. It doesn't:
+ * the fix for the EINVAL is the stride, not the layout. Submitting the v3
+ * layout makes the ioctl succeed (stride 64) but the kernel then reads
+ * every field from the wrong offset: `atom_number` comes out as 0 (it
+ * reads our `nr_extres`), `core_req` comes out as 0 (it reads our
+ * `pre_dep`), i.e. a dependency-only atom, which completes at once with
+ * BASE_JD_EVENT_DONE without ever reaching the GPU. That is exactly the
+ * "DONE, event atom_number 0, job header exception_status still 0"
+ * symptom. Verified on the same GPU/DDK (Mali-G57 MC2, r54p1) by a raw
+ * WRITE_VALUE harness: v2 layout + stride 64 executes, and
+ * panvk-g99-jm's raw-jm-progress.md documents the same 56/64 finding.
+ *
+ * Because that shape is a property of the DDK and not something to hard-code,
+ * the layout actually used is detected at run time: a NULL job is submitted
+ * in the v2 shape and then in the v3 (seq_nr-first) shape, and the first one
+ * the job manager executes wins (see panvk_kbase_atom_layout_get()).
+ * PANVK_KBASE_ATOM_LAYOUT=v2|v3 forces one. The shape makes no difference to
+ * performance: `seq_nr` is only a grouping label for tracing, and both shapes
+ * go through the same JOB_SUBMIT path with the same single atom per ioctl.
  *
  * IMPORTANT #2 -- there is no per-atom job-slot override, don't invent one:
- * with the v3 atom fixed, JOB_SUBMIT started being *accepted*, but the
- * submitted atom then sat forever with no completion event and no
+ * with the (wrongly v3-shaped, see above) atom, JOB_SUBMIT was *accepted*
+ * but the submitted atom then sat forever with no completion event and no
  * fault event either, until our own watchdog timed it out ("device is
  * either stuck or its watchdog didn't fire"). An earlier revision of
  * this file "fixed" that by adding a `jobslot` byte to the atom (right
@@ -118,7 +131,8 @@
  *
  *   - KBASE_IOCTL_VERSION_CHECK   = _IOWR(0x80, 0, {u16 major, u16 minor})
  *   - KBASE_IOCTL_JOB_SUBMIT      = _IOW (0x80, 2, {u64 addr, u32 nr_atoms, u32 stride})
- *   - struct base_jd_atom   (v3, 64 bytes, see layout below) -- what we submit
+ *   - struct base_jd_atom_v2 (56 bytes) padded to the 64-byte stride -- what
+ *     we submit (layout below)
  *   - struct base_jd_event_v2 (24 bytes: u32 event_code, u8 atom_number,
  *     u8 pad[3], u64 udata[2])
  *   - BASE_JD_EVENT_DONE = 0x01
@@ -127,6 +141,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -178,55 +193,36 @@ struct panvk_kbase_dependency {
 };
 #define PANVK_KBASE_DEP_TYPE_DATA 1
 
-/* struct base_jd_atom (v3), byte-for-byte: 64 bytes total. This is
- * base_jd_atom_v2 with a `seq_nr` prepended and one byte of its trailing
- * padding repurposed as `renderpass_id` -- see the big comment at the
- * top of this file for why v3 (not v2) is what this kernel actually
- * accepts. Every field still falls on its natural alignment boundary in
- * this order, so no __attribute__((packed)) is needed on either aarch64
- * or x86_64. */
+/* struct base_jd_atom_v2, byte for byte (56 bytes), padded to the 64-byte
+ * stride this kernel's JOB_SUBMIT requires -- see the big comment at the
+ * top of this file. Do NOT put anything in front of `jc`: the kernel reads
+ * `jc` from offset 0. Every field sits on its natural alignment boundary,
+ * so no __attribute__((packed)) is needed. */
 struct panvk_kbase_atom {
-   uint64_t seq_nr;                        /* offset 0  */
-   uint64_t jc;                            /* offset 8  */
-   uint64_t udata[2];                      /* offset 16 (base_jd_udata) */
-   uint64_t extres_list;                   /* offset 32 */
-   uint16_t nr_extres;                     /* offset 40 */
-   uint8_t jit_id[2];                      /* offset 42 */
-   struct panvk_kbase_dependency pre_dep[2]; /* offset 44 */
-   uint8_t atom_number;                    /* offset 48 */
-   uint8_t prio;                           /* offset 49 */
-   uint8_t device_nr;                      /* offset 50 */
-   /* CORRECTION -- this offset was previously named `reserved0` here,
-    * with a comment claiming it can never be a job-slot selector and
-    * that BASE_JD_REQ_JOB_SLOT doesn't exist anywhere in the kbase ABI
-    * (see "IMPORTANT #2" at the top of this file for that claim in
-    * full). That claim doesn't hold up: the current upstream GPL kbase
-    * UAPI header (mali_base_jm_kernel.h, ARM copyright 2019-2021,
-    * fetched and checked directly against this struct, not recalled
-    * from memory) names this exact offset `jobslot` -- "Job slot to
-    * use when BASE_JD_REQ_JOB_SLOT is specified" -- and defines
-    * core_req bit 17 as exactly that: "Request the atom be executed
-    * on a specific job slot. When this flag is specified, it takes
-    * precedence over any existing job slot selection logic." The tree
-    * "IMPORTANT #2" was checked against (a b_r10p0-era one among them)
-    * simply predates this field's introduction to the ABI; absent
-    * there in 2017 doesn't mean never added. This device's R54P1-era
-    * driver postdates the 2019-2021 header above, so there's no
-    * ABI-age reason to expect the field to be missing here.
-    * Left at 0 / PANVK_KBASE_JD_REQ_JOB_SLOT left unset below for now:
-    * correcting the field's name isn't by itself evidence explicit
-    * job-slot routing is what this device needs -- automatic routing
-    * (the kernel picking a slot from core_req alone, which is what
-    * leaving this flag unset requests) is equally real, documented,
-    * default kbase behaviour. Revisit only if the pre_dep fix below
-    * turns out not to be the whole story. */
-   uint8_t jobslot;                        /* offset 51 */
-   uint32_t core_req;                      /* offset 52 */
-   uint8_t renderpass_id;                  /* offset 56 */
-   uint8_t padding[7];                     /* offset 57 */
-};                                          /* size 64 */
+   uint64_t jc;                              /* offset 0  */
+   uint64_t udata[2];                        /* offset 8  (base_jd_udata) */
+   uint64_t extres_list;                     /* offset 24 */
+   uint16_t nr_extres;                       /* offset 32 */
+   uint8_t jit_id[2];                        /* offset 34 */
+   struct panvk_kbase_dependency pre_dep[2]; /* offset 36 */
+   uint8_t atom_number;                      /* offset 40 */
+   uint8_t prio;                             /* offset 41 */
+   uint8_t device_nr;                        /* offset 42 */
+   /* Job slot to use when PANVK_KBASE_JD_REQ_JOB_SLOT is set. Left at 0
+    * (automatic routing): a vertex+tiler (CS|T) atom and a fragment (FS)
+    * atom are routed by core_req alone. */
+   uint8_t jobslot;                          /* offset 43 */
+   uint32_t core_req;                        /* offset 44 */
+   /* v2 ends here with padding[8] (56 bytes); the extra 8 bytes bring the
+    * element to the 64-byte stride. All zero. */
+   uint8_t padding[16];                      /* offset 48 */
+};                                           /* size 64 */
 _Static_assert(sizeof(struct panvk_kbase_atom) == 64,
-               "base_jd_atom (v3) must be 64 bytes");
+               "JOB_SUBMIT stride on this kernel is 64");
+_Static_assert(offsetof(struct panvk_kbase_atom, jc) == 0 &&
+               offsetof(struct panvk_kbase_atom, atom_number) == 40 &&
+               offsetof(struct panvk_kbase_atom, core_req) == 44,
+               "must match struct base_jd_atom_v2");
 
 /* Request the atom be executed on a specific job slot (the `jobslot`
  * field above), instead of letting the kernel's scheduler pick one
@@ -383,9 +379,7 @@ _Static_assert(sizeof(struct panvk_kbase_atom) == 64,
 
 #define PANVK_KBASE_JD_PRIO_MEDIUM 0
 
-/* struct base_jd_event_v2, byte-for-byte: 24 bytes. Unlike the atom
- * struct, the event struct did NOT change shape between v2 and v3 --
- * only the submitted atom did -- so this is unaffected by that fix. */
+/* struct base_jd_event_v2, byte-for-byte: 24 bytes. */
 struct panvk_kbase_event_v2 {
    uint32_t event_code;
    uint8_t atom_number;
@@ -401,6 +395,72 @@ enum panvk_kbase_atom_kind {
    PANVK_KBASE_ATOM_VERTEX_TILER,
    PANVK_KBASE_ATOM_FRAGMENT,
 };
+
+/* The two atom shapes a kbase JOB_SUBMIT(stride = 64) may be asked to parse.
+ * Which one a given kernel honours is detected at run time (see
+ * panvk_kbase_atom_layout_get()), because getting it wrong is silent: the
+ * kernel just sees a dependency-only atom and completes it with DONE.
+ *   V2: base_jd_atom_v2 bytes (jc at offset 0), padded to 64 -- what r54p1
+ *       was verified to execute.
+ *   V3: base_jd_atom as shipped in older DDKs: `seq_nr` first, `jc` at 8. */
+enum panvk_kbase_atom_layout {
+   PANVK_KBASE_ATOM_LAYOUT_UNKNOWN = 0,
+   PANVK_KBASE_ATOM_LAYOUT_V2,
+   PANVK_KBASE_ATOM_LAYOUT_V3,
+};
+
+struct panvk_kbase_atom_v3 {
+   uint64_t seq_nr;                          /* offset 0  */
+   uint64_t jc;                              /* offset 8  */
+   uint64_t udata[2];                        /* offset 16 */
+   uint64_t extres_list;                     /* offset 32 */
+   uint16_t nr_extres;                       /* offset 40 */
+   uint8_t jit_id[2];                        /* offset 42 */
+   struct panvk_kbase_dependency pre_dep[2]; /* offset 44 */
+   uint8_t atom_number;                      /* offset 48 */
+   uint8_t prio;                             /* offset 49 */
+   uint8_t device_nr;                        /* offset 50 */
+   uint8_t jobslot;                          /* offset 51 */
+   uint32_t core_req;                        /* offset 52 */
+   uint8_t renderpass_id;                    /* offset 56 */
+   uint8_t padding[7];                       /* offset 57 */
+};                                           /* size 64 */
+_Static_assert(sizeof(struct panvk_kbase_atom_v3) == 64,
+               "base_jd_atom (v3) is 64 bytes");
+
+union panvk_kbase_atom_u {
+   struct panvk_kbase_atom v2;
+   struct panvk_kbase_atom_v3 v3;
+};
+_Static_assert(sizeof(union panvk_kbase_atom_u) == 64,
+               "JOB_SUBMIT stride on this kernel is 64");
+
+static void
+panvk_kbase_atom_fill(union panvk_kbase_atom_u *out,
+                      enum panvk_kbase_atom_layout layout, uint64_t jc,
+                      uint64_t cookie, uint32_t core_req, uint8_t atom_number)
+{
+   memset(out, 0, sizeof(*out));
+
+   /* pre_dep[] stays zeroed in both shapes (the queue is synchronous, no atom
+    * ever depends on another), .jobslot stays 0 (automatic routing). */
+   if (layout == PANVK_KBASE_ATOM_LAYOUT_V3) {
+      out->v3.seq_nr = atom_number;
+      out->v3.jc = jc;
+      out->v3.udata[0] = cookie;
+      out->v3.udata[1] = jc;
+      out->v3.core_req = core_req;
+      out->v3.atom_number = atom_number;
+      out->v3.prio = PANVK_KBASE_JD_PRIO_MEDIUM;
+   } else {
+      out->v2.jc = jc;
+      out->v2.udata[0] = cookie;
+      out->v2.udata[1] = jc;
+      out->v2.core_req = core_req;
+      out->v2.atom_number = atom_number;
+      out->v2.prio = PANVK_KBASE_JD_PRIO_MEDIUM;
+   }
+}
 
 /* kbase hands the atom's `udata` back verbatim in the completion event, so it
  * is the one reliable way to tell *our* completion event from any other event
@@ -544,8 +604,9 @@ panvk_kbase_atom_timeout_ns(void)
 static bool
 panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
                            const struct panvk_kbase_inval *inval,
-                           enum panvk_kbase_atom_kind kind, uint64_t jc,
-                           bool force_verify, int64_t timeout_ns,
+                           enum panvk_kbase_atom_kind kind,
+                           enum panvk_kbase_atom_layout layout, uint64_t jc,
+                           bool force_verify, bool quiet, int64_t timeout_ns,
                            bool *status_ok)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
@@ -577,26 +638,8 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       PANVK_KBASE_EVT_COOKIE |
       (uint64_t)__atomic_add_fetch(&submit_seq, 1, __ATOMIC_RELAXED);
 
-   struct panvk_kbase_atom atom = {
-      /* No logical grouping of atoms beyond ordinary pre_dep chaining,
-       * so seq_nr just mirrors atom_number. */
-      .seq_nr = atom_number,
-      .udata = {cookie, jc},
-      .jc = jc,
-      .core_req = core_req,
-      .atom_number = atom_number,
-      .prio = PANVK_KBASE_JD_PRIO_MEDIUM,
-      /* .jobslot is left at 0 (automatic routing) -- see the struct
-       * definition above. */
-      /* renderpass_id is only meaningful with BASE_JD_REQ_START/END_RENDERPASS,
-       * which we don't use (no JM incremental rendering here) -- 0 is
-       * "not part of a renderpass". */
-      .renderpass_id = 0,
-      /* pre_dep[0]/[1] both left zeroed -- see the big comment below
-       * for why this atom never declares a dependency on a prior one,
-       * even though a prior atom (the vertex/tiler half of the same
-       * batch, for a fragment atom) may well exist. */
-   };
+   union panvk_kbase_atom_u atom;
+   panvk_kbase_atom_fill(&atom, layout, jc, cookie, core_req, atom_number);
 
    /* CORRECTION -- an earlier revision of this function set
     * atom.pre_dep[0] here, pointing at queue->jm_last_atom whenever
@@ -634,7 +677,7 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
    struct panvk_kbase_job_submit submit = {
       .addr = (uintptr_t)&atom,
       .nr_atoms = 1,
-      .stride = sizeof(atom),
+      .stride = sizeof(atom), /* == 64, see the struct definition */
    };
 
    /* This queue is fully synchronous, so there must be no event waiting on
@@ -690,7 +733,8 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       int64_t remaining_ns = deadline_ns - now_ns;
       if (remaining_ns <= 0) {
          if (done_events) {
-            mesa_logw("panvk: kbase atom %u: %u DONE event(s) seen but no job "
+            if (!quiet)
+               mesa_logw("panvk: kbase atom %u: %u DONE event(s) seen but no job "
                       "header ever reported DONE; trusting the kernel (see "
                       "the warnings above)", atom_number, done_events);
             return true;
@@ -742,7 +786,7 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       const bool ours = evt.udata[0] == cookie;
       const bool unattributed = evt.udata[0] == 0 && evt.udata[1] == 0;
 
-      if (verify)
+      if (verify && !quiet)
          mesa_logw("panvk: kbase event: code=0x%x atom=%u (submitted %u) "
                    "udata=0x%" PRIx64 ",0x%" PRIx64 " (sent 0x%" PRIx64
                    ") -> %s",
@@ -751,6 +795,18 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
                    ours ? "ours" : unattributed ? "unattributed" : "foreign");
 
       if (!ours && !unattributed) {
+         /* A probe (force_verify) that gets back a udata it never sent has
+          * its answer: the kernel parsed the atom from other offsets than
+          * the ones used, i.e. the wrong atom shape. Don't sit out the
+          * timeout for an event that will never carry our cookie. */
+         if (force_verify) {
+            if (!quiet)
+               mesa_logw("panvk: kbase atom came back with a foreign udata "
+                         "(0x%" PRIx64 ",0x%" PRIx64 "): wrong atom shape",
+                         evt.udata[0], evt.udata[1]);
+            return true;
+         }
+
          mesa_logw("panvk: ignoring kbase event that carries another cookie "
                    "(code=0x%x atom=%u)", evt.event_code, evt.atom_number);
          continue;
@@ -774,12 +830,14 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
                                       &bad_jc, &bad_status)) {
          if (status_ok)
             *status_ok = true;
-         mesa_logw("panvk: kbase atom %u: every job in chain 0x%" PRIx64
-                   " reports DONE", atom_number, jc);
+         if (!quiet)
+            mesa_logw("panvk: kbase atom %u: every job in chain 0x%" PRIx64
+                      " reports DONE", atom_number, jc);
          return true;
       }
 
-      mesa_logw("panvk: kbase reported DONE for atom %u (%s event) but job "
+      if (!quiet)
+         mesa_logw("panvk: kbase reported DONE for atom %u (%s event) but job "
                 "0x%" PRIx64 " in chain 0x%" PRIx64 " still has "
                 "exception_status=0x%x after %d ms (CPU caches "
                 "invalidated). Either the atom never reached the GPU or "
@@ -825,8 +883,9 @@ panvk_kbase_log_ddk_version(int fd)
 }
 
 static bool
-panvk_kbase_selftest_run(struct panvk_gpu_queue *queue, bool cached,
-                         const char *what)
+panvk_kbase_null_job_probe(struct panvk_gpu_queue *queue,
+                           enum panvk_kbase_atom_layout layout, bool cached,
+                           bool quiet, const char *what)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_priv_bo *bo = NULL;
@@ -835,7 +894,9 @@ panvk_kbase_selftest_run(struct panvk_gpu_queue *queue, bool cached,
       panvk_priv_bo_create(dev, 4096, cached ? PAN_KMOD_BO_FLAG_WB_MMAP : 0,
                            VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &bo);
    if (res != VK_SUCCESS || !bo->addr.host) {
-      mesa_logw("panvk: kbase self-test (%s): can't allocate a test BO", what);
+      if (!quiet)
+         mesa_logw("panvk: kbase self-test (%s): can't allocate a test BO",
+                   what);
       if (res == VK_SUCCESS)
          panvk_priv_bo_unref(bo);
       return false;
@@ -855,16 +916,98 @@ panvk_kbase_selftest_run(struct panvk_gpu_queue *queue, bool cached,
    const struct panvk_kbase_inval inval = {.bo = cached ? bo : NULL};
    bool status_ok = false;
    bool ok = panvk_queue_jm_submit_atom(queue, &inval,
-                                        PANVK_KBASE_ATOM_VERTEX_TILER,
-                                        bo->addr.dev, true, 2000000000ll,
-                                        &status_ok);
+                                        PANVK_KBASE_ATOM_VERTEX_TILER, layout,
+                                        bo->addr.dev, true, quiet,
+                                        2000000000ll, &status_ok);
 
-   mesa_logw("panvk: kbase self-test (%s): atom %s, job header status %s",
-             what, ok ? "completed" : "FAILED",
-             status_ok ? "DONE" : "NOT updated");
+   if (!quiet)
+      mesa_logw("panvk: kbase self-test (%s): atom %s, job header status %s",
+                what, ok ? "completed" : "FAILED",
+                status_ok ? "DONE" : "NOT updated");
 
    panvk_priv_bo_unref(bo);
    return ok && status_ok;
+}
+
+static const char *
+panvk_kbase_layout_name(enum panvk_kbase_atom_layout layout)
+{
+   switch (layout) {
+   case PANVK_KBASE_ATOM_LAYOUT_V2:
+      return "v2 (base_jd_atom_v2 bytes, jc at offset 0, stride 64)";
+   case PANVK_KBASE_ATOM_LAYOUT_V3:
+      return "v3 (seq_nr first, jc at offset 8, stride 64)";
+   default:
+      return "unknown";
+   }
+}
+
+/* Find the atom shape this kernel actually executes: submit a NULL job in
+ * each candidate shape (on an UNCACHED buffer, so no CPU cache maintenance
+ * is involved) and keep the first one whose job header the job manager marks
+ * DONE. A wrong shape is harmless: the kernel reads zeros where core_req
+ * should be and completes the atom as a dependency-only one. */
+static enum panvk_kbase_atom_layout
+panvk_kbase_detect_atom_layout(struct panvk_gpu_queue *queue, bool quiet)
+{
+   static const enum panvk_kbase_atom_layout candidates[] = {
+      PANVK_KBASE_ATOM_LAYOUT_V2,
+      PANVK_KBASE_ATOM_LAYOUT_V3,
+   };
+
+   for (unsigned i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+      if (panvk_kbase_null_job_probe(queue, candidates[i], false, quiet,
+                                     panvk_kbase_layout_name(candidates[i])))
+         return candidates[i];
+   }
+
+   mesa_logw("panvk: kbase: neither atom shape executed a NULL job; assuming "
+             "v2 (the shape verified on r54p1). Set PANVK_KBASE_ATOM_LAYOUT="
+             "v2|v3 to force one.");
+   return PANVK_KBASE_ATOM_LAYOUT_V2;
+}
+
+/* The atom shape used for every real submission. Resolved once per process:
+ * PANVK_KBASE_ATOM_LAYOUT=v2|v3 forces one (v3 is accepted by JOB_SUBMIT too,
+ * it just isn't executed by r54p1 -- see the top of this file), anything else
+ * auto-detects. */
+static enum panvk_kbase_atom_layout
+panvk_kbase_atom_layout_get(struct panvk_gpu_queue *queue)
+{
+   static uint32_t resolved;
+   uint32_t cur = __atomic_load_n(&resolved, __ATOMIC_ACQUIRE);
+   if (cur != PANVK_KBASE_ATOM_LAYOUT_UNKNOWN)
+      return (enum panvk_kbase_atom_layout)cur;
+
+   const char *env = os_get_option("PANVK_KBASE_ATOM_LAYOUT");
+   const bool verbose = panvk_kbase_verify_enabled();
+   bool forced = true;
+   enum panvk_kbase_atom_layout layout;
+
+   if (env && !strcmp(env, "v2")) {
+      layout = PANVK_KBASE_ATOM_LAYOUT_V2;
+   } else if (env && !strcmp(env, "v3")) {
+      layout = PANVK_KBASE_ATOM_LAYOUT_V3;
+   } else {
+      forced = false;
+      layout = panvk_kbase_detect_atom_layout(queue, !verbose);
+   }
+
+   __atomic_store_n(&resolved, (uint32_t)layout, __ATOMIC_RELEASE);
+
+   if (verbose || forced)
+      mesa_logw("panvk: kbase atom layout: %s%s",
+                panvk_kbase_layout_name(layout), forced ? " [forced]" : "");
+
+   return layout;
+}
+
+static bool
+panvk_kbase_selftest_run(struct panvk_gpu_queue *queue, bool cached,
+                         const char *what)
+{
+   return panvk_kbase_null_job_probe(queue, panvk_kbase_atom_layout_get(queue),
+                                     cached, false, what);
 }
 
 static void
@@ -966,7 +1109,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       const struct panvk_kbase_inval inval = {.pool = &cmdbuf->desc_pool};
       bool ok = panvk_queue_jm_submit_atom(
          queue, &inval, PANVK_KBASE_ATOM_VERTEX_TILER,
-         batch->vtc_jc.first_job, false, 0, NULL);
+         panvk_kbase_atom_layout_get(queue), batch->vtc_jc.first_job, false,
+         false, 0, NULL);
 
       /* Decode/abort-on-fault must NOT be skipped just because this atom
        * already failed -- that's exactly the case where the dump is
@@ -1019,7 +1163,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    if (batch->frag_jc.first_job) {
       const struct panvk_kbase_inval inval = {.pool = &cmdbuf->desc_pool};
       bool ok = panvk_queue_jm_submit_atom(
-         queue, &inval, PANVK_KBASE_ATOM_FRAGMENT, batch->frag_jc.first_job,
+         queue, &inval, PANVK_KBASE_ATOM_FRAGMENT,
+         panvk_kbase_atom_layout_get(queue), batch->frag_jc.first_job, false,
          false, 0, NULL);
 
       if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) || !ok) {
