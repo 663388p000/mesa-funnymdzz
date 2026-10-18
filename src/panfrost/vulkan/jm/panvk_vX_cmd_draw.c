@@ -2296,6 +2296,12 @@ panvk_emit_vs_position_v9(struct panvk_cmd_buffer *cmdbuf,
                    : panvk_priv_mem_dev_addr(vs->spds.pos_triangles);
       cfg.thread_storage = draw->tls;
       cfg.fau = cmdbuf->state.gfx.vs.push_uniforms;
+      /* Valhall's shader environment carries the FAU entry count (64-bit
+       * entries) next to the pointer: left at 0 the shader gets no fast
+       * access uniforms at all (the job still reports DONE, the vertices
+       * just all collapse to garbage and nothing is drawn). The count is
+       * the compiler's fau.total_count, not a constant. */
+      cfg.fau_count = vs->fau.total_count;
    }
 }
 
@@ -2509,6 +2515,9 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
          panvk_shader_only_variant(get_fs(cmdbuf))->spd);
       cfg.shader.thread_storage = draw->tls;
       cfg.shader.fau = cmdbuf->state.gfx.fs.push_uniforms;
+      /* See the comment in panvk_emit_vs_position_v9(). */
+      cfg.shader.fau_count =
+         panvk_shader_only_variant(get_fs(cmdbuf))->fau.total_count;
    }
 
    return VK_SUCCESS;
@@ -2705,6 +2714,8 @@ panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
          cfg.shader = panvk_priv_mem_dev_addr(vs->spds.var);
          cfg.thread_storage = draw->tls;
          cfg.fau = cmdbuf->state.gfx.vs.push_uniforms;
+         /* Same shader (variant) as the position environment above. */
+         cfg.fau_count = vs->fau.total_count;
       }
    }
 
