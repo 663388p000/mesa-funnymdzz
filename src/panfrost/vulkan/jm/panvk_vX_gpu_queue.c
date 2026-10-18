@@ -588,6 +588,35 @@ panvk_kbase_atom_timeout_ns(void)
    return cached_ns;
 }
 
+/* Human-readable name for a JM job exception code (base_jd_event_code). */
+static const char *
+panvk_kbase_exception_name(uint32_t code)
+{
+   switch (code) {
+   case 0x40: return "JOB_CONFIG_FAULT (bad job descriptor/config)";
+   case 0x41: return "JOB_POWER_FAULT";
+   case 0x42: return "JOB_READ_FAULT (GPU read of an unmapped VA)";
+   case 0x43: return "JOB_WRITE_FAULT (GPU write to an unmapped VA)";
+   case 0x44: return "JOB_AFFINITY_FAULT";
+   case 0x48: return "JOB_BUS_FAULT";
+   case 0x50: return "INSTR_INVALID_PC";
+   case 0x51: return "INSTR_INVALID_ENC";
+   case 0x52: return "INSTR_TYPE_MISMATCH";
+   case 0x53: return "INSTR_OPERAND_FAULT";
+   case 0x54: return "INSTR_TLS_FAULT";
+   case 0x55: return "INSTR_BARRIER_FAULT";
+   case 0x56: return "INSTR_ALIGN_FAULT";
+   case 0x58: return "DATA_INVALID_FAULT (invalid descriptor/vertex/index data)";
+   case 0x59: return "TILE_RANGE_FAULT";
+   case 0x5a: return "ADDR_RANGE_FAULT";
+   case 0x60: return "OUT_OF_MEMORY (tiler heap exhausted)";
+   case 0x7f: return "UNKNOWN";
+   case 0x80: return "DELAYED_BUS_FAULT";
+   case 0x88: return "SHAREABILITY_FAULT";
+   default:   return "unrecognised";
+   }
+}
+
 /* Submit a single job chain as one kbase JM atom and block until it has
  * completed or the wait times out. Called once per batch per atom kind
  * (vertex/tiler, then fragment), always waiting out the previous atom
@@ -814,8 +843,12 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
 
       if (evt.event_code != PANVK_KBASE_JD_EVENT_DONE) {
          mesa_loge("panvk: kbase JM atom %u (job chain 0x%" PRIx64
-                   ") reported failure (event_code 0x%x)",
-                   atom_number, jc, evt.event_code);
+                   ") reported failure (event_code 0x%x: %s)",
+                   atom_number, jc, evt.event_code,
+                   panvk_kbase_exception_name(evt.event_code));
+         if (!dev->debug.decode_ctx)
+            mesa_loge("panvk: re-run with PANVK_DEBUG=kbase_diag to dump "
+                      "only the failing job chain");
          return false;
       }
 
