@@ -94,4 +94,16 @@ uint64_t panvk_per_arch(cmd_dispatch_prepare_tls)(
    struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,
    const struct pan_compute_dim *dim, bool indirect);
 
+
+#if PAN_ARCH >= 9 && PAN_ARCH < 10
+/* Valhall + Job Manager: pack one COMPUTE_JOB and chain it on the current
+ * batch's vertex/tiler/compute job chain. Shared by vkCmdDispatch* and the
+ * precompiled-kernel dispatch (vkCmdCopyBuffer, vkCmdCopyImageToBuffer, ...). */
+VkResult panvk_per_arch(jm_emit_compute_job)(
+   struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *cs,
+   const struct pan_compute_dim *dim, uint64_t res_table, uint64_t fau_ptr,
+   uint32_t fau_count, uint64_t tsd, bool barrier, bool suppress_prefetch,
+   unsigned local_dep, unsigned global_dep);
+#endif
+
 #endif
