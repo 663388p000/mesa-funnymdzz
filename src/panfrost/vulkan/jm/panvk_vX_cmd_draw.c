@@ -2800,6 +2800,28 @@ prepare_draw_v9(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    batch->tlsinfo.tls.size = MAX3(vs->info.tls_size, fs ? fs->info.tls_size : 0,
                                   batch->tlsinfo.tls.size);
 
+   /* The fragment shader's BLEND instruction reads its blend descriptor from
+    * the FAU (sysval fs.blend_descs[loc], 64-bit, shown as `u2` in the shader
+    * disassembly), and the fixed-function blend path at the end of the shader
+    * (BLEND ... .end, then BRANCHZI to u2.w1) depends on it. Those sysvals are
+    * filled in by blend_emit_descs(), so it has to run *before* the sysvals and
+    * the FS push uniforms are built -- the CSF path does this in
+    * prepare_blend(). This path used to call it only later, while emitting the
+    * DCD, so the FS FAU was captured with an all-zero blend descriptor: the
+    * vertex job completed, but the fragment job never did (kbase reported
+    * TERMINATED). The DCD emission calls blend_emit_descs() again into the
+    * descriptor array it actually hands to the hardware; same inputs, same
+    * result, so this pass only needs a scratch array. */
+   if (fs && cmdbuf->state.gfx.fs.shader &&
+       cmdbuf->state.gfx.render.fb.layout.rt_count > 0) {
+      struct mali_blend_packed blend_scratch[MAX_RTS];
+
+      memset(blend_scratch, 0, sizeof(blend_scratch));
+      result = panvk_per_arch(blend_emit_descs)(cmdbuf, blend_scratch);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
    panvk_per_arch(cmd_prepare_draw_sysvals)(cmdbuf, &draw->info, fs);
 
    struct pan_ptr vs_push_uniforms;
