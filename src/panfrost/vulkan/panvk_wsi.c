@@ -13,6 +13,7 @@
 #include "panvk_instance.h"
 #include "panvk_physical_device.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -77,6 +78,48 @@ panvk_can_present_on_device(VkPhysicalDevice pdevice, int fd)
    return match;
 }
 
+/* ROOT CAUSE of "renders fine, window stays black" on Valhall/kbase:
+ *
+ * With sw_device=true, common WSI defaults to its "buffer blit" strategy:
+ * the swapchain image is an OPTIMAL-tiled image (PanVK picks AFBC for it),
+ * plus a separate linear host-visible VkBuffer.  On every present WSI
+ * records vkCmdCopyImageToBuffer(image -> buffer) and the X11 SHM/PutImage
+ * path then reads that buffer from the CPU.
+ *
+ * On PAN_ARCH >= 9 on the JM backend, compute dispatch is not ported
+ * (cmd_dispatch() in jm/panvk_vX_cmd_dispatch.c is a no-op), and
+ * CmdCopyImageToBuffer is a vk_meta *compute* copy.  So the copy was
+ * silently dropped: the log shows only vertex+fragment atoms, never a
+ * compute job, and the linear present buffer stayed all zeros.
+ *
+ * Fix: ask WSI for a plain LINEAR, host-visible swapchain image that the
+ * app renders into directly (no blit, no compute, no AFBC).  The
+ * MESA_VK_WSI_DEBUG=linear switch is read inside wsi_device_init(), so it
+ * must be in place before that call.  Set PANVK_KBASE_WSI_BLIT=1 to get the
+ * old behaviour back (e.g. once v9 compute dispatch exists).
+ */
+static void
+panvk_wsi_force_linear_swapchain(void)
+{
+   const char *keep_blit = getenv("PANVK_KBASE_WSI_BLIT");
+   if (keep_blit && keep_blit[0] && keep_blit[0] != '0')
+      return;
+
+   const char *cur = getenv("MESA_VK_WSI_DEBUG");
+   if (!cur || !cur[0]) {
+      setenv("MESA_VK_WSI_DEBUG", "linear", 1);
+      return;
+   }
+
+   /* Already asks for linear, or explicitly asks for the blit path. */
+   if (strstr(cur, "linear") || strstr(cur, "buffer"))
+      return;
+
+   char merged[256];
+   snprintf(merged, sizeof(merged), "%s,linear", cur);
+   setenv("MESA_VK_WSI_DEBUG", merged, 1);
+}
+
 VkResult
 panvk_wsi_init(struct panvk_physical_device *physical_device)
 {
@@ -105,6 +148,11 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
       false;
 #endif
    VkResult result;
+
+   /* The CPU/SHM presentation path (everything except raw/dmabuf DRI3)
+    * must not depend on a GPU compute copy: see comment above. */
+   if (uses_kbase && !kbase_dmabuf)
+      panvk_wsi_force_linear_swapchain();
 
    result = wsi_device_init(&physical_device->wsi_device,
                             panvk_physical_device_to_handle(physical_device),
