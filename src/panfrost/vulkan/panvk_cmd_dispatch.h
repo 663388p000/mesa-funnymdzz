@@ -12,6 +12,8 @@
 
 #include "pan_desc.h"
 
+struct panvk_buffer;
+
 enum panvk_cmd_compute_dirty_state {
    PANVK_CMD_COMPUTE_DIRTY_CS,
    PANVK_CMD_COMPUTE_DIRTY_DESC_STATE,
@@ -80,6 +82,10 @@ struct panvk_dispatch_info {
 
    struct {
       uint64_t buffer_dev_addr;
+      /* Source VkBuffer + offset of the VkDispatchIndirectCommand. Only set
+       * (and only needed) by the Valhall/JM backend. */
+      struct panvk_buffer *buffer;
+      uint64_t offset;
    } indirect;
 
 #if PAN_ARCH >= 10
@@ -99,6 +105,10 @@ uint64_t panvk_per_arch(cmd_dispatch_prepare_tls)(
 /* Valhall + Job Manager: pack one COMPUTE_JOB and chain it on the current
  * batch's vertex/tiler/compute job chain. Shared by vkCmdDispatch* and the
  * precompiled-kernel dispatch (vkCmdCopyBuffer, vkCmdCopyImageToBuffer, ...). */
+/* XOR mask flipping a job header between two job types (see
+ * panvk_jm_indirect_fixup). */
+void panvk_per_arch(jm_job_type_xor)(uint32_t out[8], unsigned a, unsigned b);
+
 VkResult panvk_per_arch(jm_emit_compute_job)(
    struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *cs,
    const struct pan_compute_dim *dim, uint64_t res_table, uint64_t fau_ptr,
