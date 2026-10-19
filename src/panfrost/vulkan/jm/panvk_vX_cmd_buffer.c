@@ -31,6 +31,8 @@
 #include "pan_props.h"
 #include "pan_samples.h"
 
+#include "util/log.h"
+
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
 
@@ -77,7 +79,9 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
    if (!batch->fb.desc.gpu && !batch->vtc_jc.first_job) {
       if (util_dynarray_num_elements(&batch->event_ops,
-                                     struct panvk_cmd_event_op) == 0) {
+                                     struct panvk_cmd_event_op) == 0 &&
+          util_dynarray_num_elements(&batch->exec_cmdbufs,
+                                     struct panvk_cmd_buffer *) == 0) {
          /* Content-less batch, let's drop it */
          vk_free(&cmdbuf->vk.pool->alloc, batch);
       } else {
@@ -334,6 +338,9 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
+   cmdbuf->cur_batch->exec_cmdbufs = UTIL_DYNARRAY_INIT;
+   cmdbuf->cur_batch->draw_fixups = UTIL_DYNARRAY_INIT;
+   cmdbuf->cur_batch->indirect_fixups = UTIL_DYNARRAY_INIT;
    assert(cmdbuf->cur_batch);
    return cmdbuf->cur_batch;
 }
@@ -381,6 +388,9 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
       list_del(&batch->node);
       util_dynarray_fini(&batch->jobs);
       util_dynarray_fini(&batch->event_ops);
+      util_dynarray_fini(&batch->exec_cmdbufs);
+      util_dynarray_fini(&batch->draw_fixups);
+      util_dynarray_fini(&batch->indirect_fixups);
 
       vk_free(&cmdbuf->vk.pool->alloc, batch);
    }
@@ -404,6 +414,9 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
       list_del(&batch->node);
       util_dynarray_fini(&batch->jobs);
       util_dynarray_fini(&batch->event_ops);
+      util_dynarray_fini(&batch->exec_cmdbufs);
+      util_dynarray_fini(&batch->draw_fixups);
+      util_dynarray_fini(&batch->indirect_fixups);
 
       vk_free(&cmdbuf->vk.pool->alloc, batch);
    }
@@ -507,6 +520,61 @@ panvk_per_arch(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
 
    vk_command_buffer_begin(&cmdbuf->vk, pBeginInfo);
+   cmdbuf->flags = pBeginInfo->flags;
 
    return VK_SUCCESS;
+}
+
+/* Secondary command buffers on the Job Manager backend.
+ *
+ * A JM command buffer is a list of batches whose jobs and descriptors live in
+ * the command buffer's own pools, and a batch's jobs point at that batch's own
+ * tiler context, thread storage and framebuffer descriptor. So a secondary
+ * command buffer is "called" the way the queue already handles any other
+ * batch: ExecuteCommands records a marker on a batch boundary, and the queue
+ * submits the secondary's batches right after that batch. State is not
+ * inherited, which matches the spec (secondary state starts out undefined and
+ * the primary's state is undefined again afterwards).
+ *
+ * What this can't do is VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
+ * secondaries: their draws would have to be spliced into the primary's open
+ * render-pass batch, using the primary's tiler context and framebuffer, which
+ * don't exist yet when the secondary is recorded. Those are rejected loudly
+ * instead of silently dropping their draws. */
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdExecuteCommands)(VkCommandBuffer commandBuffer,
+                                   uint32_t commandBufferCount,
+                                   const VkCommandBuffer *pCommandBuffers)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, primary, commandBuffer);
+
+   for (uint32_t i = 0; i < commandBufferCount; i++) {
+      VK_FROM_HANDLE(panvk_cmd_buffer, secondary, pCommandBuffers[i]);
+
+      if (secondary->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) {
+         static bool warned;
+
+         if (!warned) {
+            warned = true;
+            mesa_loge("panvk: secondary command buffers recorded with "
+                      "RENDER_PASS_CONTINUE are not supported on the Job "
+                      "Manager backend; skipped");
+         }
+         continue;
+      }
+
+      /* Same trick as vkCmdSetEvent2(): put the call on a batch boundary so
+       * it runs after everything recorded so far and before anything
+       * recorded later. */
+      const bool had_batch = primary->cur_batch != NULL;
+
+      if (!had_batch)
+         panvk_per_arch(cmd_open_batch)(primary);
+
+      util_dynarray_append(&primary->cur_batch->exec_cmdbufs, secondary);
+      panvk_per_arch(cmd_close_batch)(primary);
+
+      if (had_batch)
+         panvk_per_arch(cmd_open_batch)(primary);
+   }
 }
