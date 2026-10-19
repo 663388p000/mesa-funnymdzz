@@ -12,8 +12,17 @@
 
 struct panvk_priv_bo;
 
+struct panvk_device_memory;
+
 struct panvk_buffer {
    struct vk_buffer vk;
+
+   /* Memory binding. Only the Job Manager backend needs it: on Valhall/JM
+    * indirect draw/dispatch arguments are read back on the CPU when the batch
+    * is submitted (see panvk_jm_resolve_indirect()). NULL for sparse or still
+    * unbound buffers. */
+   struct panvk_device_memory *mem;
+   uint64_t mem_offset;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_buffer, vk.base, VkBuffer,
