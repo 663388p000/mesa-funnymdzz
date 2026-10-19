@@ -311,7 +311,10 @@ panvk_per_arch(get_physical_device_features)(
       .dualSrcBlend = true,
       .logicOp = true,
       .multiDrawIndirect = PAN_ARCH >= 10,
-      .drawIndirectFirstInstance = true,
+      /* Valhall/JM resolves indirect draws on the CPU at submit time and
+       * can't rebuild the per-instance attribute offsets that depend on
+       * firstInstance, so don't promise it there. */
+      .drawIndirectFirstInstance = PAN_ARCH != 9,
       .depthClamp = true,
       .depthBiasClamp = true,
       /*
