@@ -146,6 +146,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "util/log.h"
@@ -156,7 +157,9 @@
 
 #include "decode.h"
 
+#include "panvk_buffer.h"
 #include "panvk_cmd_buffer.h"
+#include "panvk_device_memory.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
 #include "panvk_event.h"
@@ -307,7 +310,7 @@ _Static_assert(offsetof(struct panvk_kbase_atom, jc) == 0 &&
     * perform some bookkeeping action (fence signal/wait, JIT
     * alloc/free, event set/reset/wait, ...). panvk's own
     * PANVK_EVENT_OP_* handling is done entirely in userspace (see
-    * panvk_kbase_event_is_set()/panvk_kbase_event_set() below), not
+    * panvk_event_is_set()/panvk_event_update()), not
     * through a kbase soft job, so none of the SOFT_* subtypes below
     * are ever issued by this file today; listed because the user asked
     * for every case core_req's value space defines, not just the ones
@@ -1104,6 +1107,112 @@ panvk_kbase_selftest(struct panvk_gpu_queue *queue)
    }
 }
 
+#if PAN_ARCH >= 9
+/* Map `size` bytes of a buffer's memory for CPU reading, with the CPU caches
+ * invalidated so that data the GPU wrote earlier is visible. Returns NULL on
+ * failure. When *unmap_base is non-NULL on return, the caller has to
+ * pan_kmod_bo_munmap() it once done. */
+static const uint32_t *
+panvk_jm_map_indirect_args(struct panvk_device *dev,
+                           const struct panvk_buffer *buffer, uint64_t offset,
+                           uint32_t size, void **unmap_base,
+                           size_t *unmap_size)
+{
+   *unmap_base = NULL;
+   *unmap_size = 0;
+
+   struct panvk_device_memory *mem = buffer->mem;
+   if (!mem || !mem->bo)
+      return NULL;
+
+   const uint64_t bo_size = pan_kmod_bo_size(mem->bo);
+   const uint64_t bo_off = buffer->mem_offset + offset;
+   if (bo_off + size > bo_size)
+      return NULL;
+
+   uint8_t *base = mem->addr.host;
+   if (!base) {
+      void *mapped =
+         pan_kmod_bo_mmap(mem->bo, PROT_READ | PROT_WRITE, MAP_SHARED, NULL);
+      if (mapped == MAP_FAILED)
+         return NULL;
+
+      base = mapped;
+      *unmap_base = mapped;
+      *unmap_size = bo_size;
+   }
+
+   uint8_t *ptr = base + bo_off;
+   pan_kmod_queue_bo_map_sync(mem->bo, bo_off, ptr, size,
+                              PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE);
+   pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+
+   return (const uint32_t *)ptr;
+}
+
+/* Valhall/JM has no hardware (or GPU-kernel) path to read indirect draw /
+ * dispatch arguments, so they are resolved here, on the CPU, right before the
+ * batch is handed to the kernel. Submission is synchronous: every earlier
+ * atom -- including the ones that produced the indirect buffer's contents --
+ * has completed by now. See struct panvk_jm_indirect_fixup. */
+static void
+panvk_jm_resolve_indirect(struct panvk_device *dev, struct panvk_batch *batch)
+{
+   util_dynarray_foreach(&batch->indirect_fixups,
+                         struct panvk_jm_indirect_fixup, f) {
+      uint32_t args[5] = {0};
+      uint32_t nwords;
+
+      switch (f->kind) {
+      case PANVK_JM_INDIRECT_DISPATCH:
+         nwords = 3;
+         break;
+      case PANVK_JM_INDIRECT_DRAW:
+         nwords = 4;
+         break;
+      default:
+         nwords = 5;
+         break;
+      }
+
+      void *unmap_base;
+      size_t unmap_size;
+      const uint32_t *src = panvk_jm_map_indirect_args(
+         dev, f->buffer, f->offset, nwords * sizeof(uint32_t), &unmap_base,
+         &unmap_size);
+
+      bool run = false;
+      if (src) {
+         memcpy(args, src, nwords * sizeof(uint32_t));
+
+         if (unmap_base) {
+            struct panvk_device_memory *mem = f->buffer->mem;
+            pan_kmod_bo_munmap(mem->bo, unmap_base, unmap_size);
+         }
+
+         run = f->kind == PANVK_JM_INDIRECT_DISPATCH
+                  ? panvk_per_arch(jm_apply_indirect_dispatch)(f, args)
+                  : panvk_per_arch(jm_apply_indirect_draw)(f, args);
+      } else {
+         mesa_loge("panvk: couldn't read back indirect command arguments; "
+                   "command skipped");
+      }
+
+      /* Flip the header between NULL and the real job type. The job keeps
+       * its state across re-submissions of the command buffer, so only touch
+       * it when the answer changed. */
+      if (run != f->enabled) {
+         uint32_t *hdr = f->job;
+
+         for (unsigned i = 0; i < ARRAY_SIZE(f->type_xor); i++)
+            hdr[i] ^= f->type_xor[i];
+
+         f->enabled = run;
+      }
+   }
+}
+#endif /* PAN_ARCH >= 9 */
+
 static bool
 panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
                          struct panvk_cmd_buffer *cmdbuf,
@@ -1129,10 +1238,27 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
             memcpy(&ctxs[i], &batch->tiler.ctx_templ, sizeof(*ctxs));
       }
 
+#if PAN_ARCH >= 9
+      /* The hardware writes the vertex array pointer / strides of every
+       * MALLOC_VERTEX_JOB while it runs; put back what the CPU wrote, or the
+       * job faults (DATA_INVALID_FAULT) when it's run a second time. */
+      util_dynarray_foreach(&batch->draw_fixups, struct panvk_jm_draw_fixup,
+                            fixup)
+         memcpy(fixup->words, fixup->orig, sizeof(fixup->orig));
+#endif
+
       /* We don't keep track of BO <-> job relationship, so let's just flush the
        * whole desc pool for now. */
       panvk_pool_flush_maps(&cmdbuf->desc_pool);
    }
+
+#if PAN_ARCH >= 9
+   if (util_dynarray_num_elements(&batch->indirect_fixups,
+                                  struct panvk_jm_indirect_fixup)) {
+      panvk_jm_resolve_indirect(dev, batch);
+      panvk_pool_flush_maps(&cmdbuf->desc_pool);
+   }
+#endif
 
    /* Flush pending synchronization requests before submitting the job, to
     * make sure things are GPU-visible. */
@@ -1234,29 +1360,6 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    return true;
 }
 
-/* TODO(verify): struct panvk_event (panvk_event.h) only carries a plain
- * uint32_t `syncobj` field -- there is no panvk_per_arch(event_is_set)/
- * (event_update)() declared anywhere in this codebase, so a version of
- * this file calling them could never have linked. Until
- * panvk_vX_event.c's real mechanism for that field is confirmed, this
- * treats `syncobj` directly as a plain 0/1 flag via atomic builtins, so
- * at least sets/waits within this process are data-race-free. This does
- * NOT yet know how panvk_vX_event.c / panvk_vX_cmd_event.c expect
- * `syncobj` to be used (it may need to be a real kernel syncobj handle
- * instead), so treat vkSetEvent/vkResetEvent/vkCmdWaitEvents as
- * unverified until that file is checked against this. */
-static bool
-panvk_kbase_event_is_set(struct panvk_event *event)
-{
-   return __atomic_load_n(&event->syncobj, __ATOMIC_ACQUIRE) != 0;
-}
-
-static void
-panvk_kbase_event_set(struct panvk_event *event, bool set)
-{
-   __atomic_store_n(&event->syncobj, set ? 1u : 0u, __ATOMIC_RELEASE);
-}
-
 /* vkCmdWaitEvents2() operations recorded on this batch. There's no GPU-side
  * soft-event-wait atom we submit here, so -- same spirit as the
  * synchronous atom submission above -- we just block the CPU on the
@@ -1273,11 +1376,17 @@ panvk_queue_wait_events(struct panvk_gpu_queue *queue,
       if (op->type != PANVK_EVENT_OP_WAIT)
          continue;
 
-      while (!panvk_kbase_event_is_set(op->event)) {
+      /* Spin briefly (the event is usually set by a previous batch or another
+       * thread a few microseconds from now), then back off so a long wait
+       * doesn't peg a CPU core. */
+      for (unsigned spins = 0; !panvk_event_is_set(op->event); spins++) {
          if (vk_device_is_lost(&dev->vk))
             return VK_ERROR_DEVICE_LOST;
 
-         thrd_yield();
+         if (spins < 1000)
+            thrd_yield();
+         else
+            os_time_sleep(100);
       }
    }
 
@@ -1291,16 +1400,50 @@ panvk_queue_signal_events(struct panvk_gpu_queue *queue,
    util_dynarray_foreach(&batch->event_ops, struct panvk_cmd_event_op, op) {
       switch (op->type) {
       case PANVK_EVENT_OP_SET:
-         panvk_kbase_event_set(op->event, true);
+         panvk_event_update(op->event, true);
          break;
       case PANVK_EVENT_OP_RESET:
-         panvk_kbase_event_set(op->event, false);
+         panvk_event_update(op->event, false);
          break;
       case PANVK_EVENT_OP_WAIT:
          /* Handled up-front in panvk_queue_wait_events(). */
          break;
       default:
          UNREACHABLE("bad panvk_cmd_event_op type\n");
+      }
+   }
+
+   return VK_SUCCESS;
+}
+
+/* Submit every batch of a command buffer in order. A batch that executed
+ * secondary command buffers (vkCmdExecuteCommands) submits them right after
+ * its own work and events; secondaries can't nest, so the recursion is one
+ * level deep. */
+static VkResult
+panvk_queue_submit_cmdbuf(struct panvk_gpu_queue *queue,
+                          struct panvk_cmd_buffer *cmdbuf)
+{
+   VkResult result;
+
+   list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
+      result = panvk_queue_wait_events(queue, batch);
+      if (result != VK_SUCCESS)
+         return result;
+
+      if (!panvk_queue_submit_batch(queue, cmdbuf, batch))
+         return vk_queue_set_lost(&queue->vk,
+                                  "kbase JM atom submission failed");
+
+      result = panvk_queue_signal_events(queue, batch);
+      if (result != VK_SUCCESS)
+         return result;
+
+      util_dynarray_foreach(&batch->exec_cmdbufs, struct panvk_cmd_buffer *,
+                            secondary) {
+         result = panvk_queue_submit_cmdbuf(queue, *secondary);
+         if (result != VK_SUCCESS)
+            return result;
       }
    }
 
@@ -1336,19 +1479,9 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue,
       struct panvk_cmd_buffer *cmdbuf = container_of(
          submit->command_buffers[j], struct panvk_cmd_buffer, vk);
 
-      list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
-         result = panvk_queue_wait_events(queue, batch);
-         if (result != VK_SUCCESS)
-            return result;
-
-         if (!panvk_queue_submit_batch(queue, cmdbuf, batch))
-            return vk_queue_set_lost(&queue->vk,
-                                     "kbase JM atom submission failed");
-
-         result = panvk_queue_signal_events(queue, batch);
-         if (result != VK_SUCCESS)
-            return result;
-      }
+      result = panvk_queue_submit_cmdbuf(queue, cmdbuf);
+      if (result != VK_SUCCESS)
+         return result;
    }
 
    /* Every batch above already ran to completion by the time we get here,
