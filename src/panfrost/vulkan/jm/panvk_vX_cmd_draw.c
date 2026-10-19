@@ -31,9 +31,12 @@
  * MALI_JOB_TYPE_MALLOC_VERTEX (IDVS) satu job per draw, disubmit sebagai
  * atom vertex/tiler kbase JM (lihat panvk_vX_gpu_queue.c, DDK "R54P1" --
  * struct base_jd_atom v3/64-byte, tanpa pre_dep antar-atom) -- BUKAN lagi
- * stub kosong. Yang masih belum diimplementasikan untuk v9: CmdDrawIndirect*
- * (stub, lihat TODO di bawah) dan multi-layer/multiview (hanya layer 0
- * di-encode, lihat TODO di dekat prepare_draw_v9()). */
+ * stub kosong. Untuk v9 sekarang juga sudah ada: CmdDrawIndirect* (argumen
+ * dibaca balik di CPU saat batch disubmit, lihat struct
+ * panvk_jm_indirect_fixup) dan multi-layer/multiview (satu job per layer).
+ * Belum ada: drawIndirectCount / multiDrawIndirect (tidak diiklankan di JM)
+ * dan firstInstance != 0 pada indirect draw (drawIndirectFirstInstance =
+ * false di v9). */
 #include "panvk_instance.h"
 #include "panvk_meta.h"
 #include "panvk_priv_bo.h"
@@ -76,6 +79,9 @@ struct panvk_draw_data {
    };
    uint64_t tls;
    uint64_t fb;
+   /* CPU pointer of the VS push-uniform block (v9 indirect draws patch the
+    * first_vertex / base_instance sysvals in it when the batch is submitted). */
+   void *vs_push_cpu;
    const struct pan_tiler_context *tiler_ctx;
    uint64_t viewport;
    struct {
@@ -2540,8 +2546,8 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
  *
  * Yang BELUM ditangani di sini, sengaja, supaya unit ini tetap bisa
  * di-review/di-rollback sendiri:
- *  - indirect draw (CmdDrawIndirect* masih stub di bawah);
- *  - multi-layer/multiview: hanya layer 0 yang di-encode;
+ *  - indirect draw: lihat panvk_cmd_draw_indirect_v9();
+ *  - multi-layer/multiview: satu job per layer (lihat panvk_cmd_draw_v9());
  *  - transform feedback dan tessellation.
  */
 
@@ -2580,6 +2586,36 @@ set_provoking_vertex_mode_v9(struct panvk_cmd_buffer *cmdbuf,
       state->render.first_provoking_vertex = U_TRISTATE_YES;
 }
 
+struct jm_prim_params {
+   unsigned draw_mode;
+   bool point_size_fp16;
+   unsigned index_size;
+   bool restart;
+   bool secondary;
+};
+
+/* Packs the MALLOC_VERTEX_JOB PRIMITIVE section. Also used to re-pack it once
+ * an indirect draw's arguments have been read back. */
+static void
+jm_pack_primitive(void *job_cpu, const struct jm_prim_params *p,
+                  uint32_t index_count, int32_t base_vertex)
+{
+   pan_section_pack(job_cpu, MALLOC_VERTEX_JOB, PRIMITIVE, cfg) {
+      cfg.draw_mode = p->draw_mode;
+      cfg.index_count = index_count;
+      cfg.base_vertex_offset = base_vertex;
+
+      if (p->index_size)
+         cfg.index_type = translate_index_size(p->index_size);
+
+      if (p->point_size_fp16)
+         cfg.point_size_array_format = MALI_POINT_SIZE_ARRAY_FORMAT_FP16;
+
+      cfg.primitive_restart = p->restart;
+      cfg.secondary_shader = p->secondary;
+   }
+}
+
 static VkResult
 panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
                                      struct panvk_draw_data *draw)
@@ -2606,31 +2642,20 @@ panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
 
    util_dynarray_append(&batch->jobs, ptr.cpu);
 
-   pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, PRIMITIVE, cfg) {
-      cfg.draw_mode = translate_prim(draw->info.prim);
-      cfg.index_count = draw->info.vertex.count;
+   const struct jm_prim_params prim = {
+      .draw_mode = translate_prim(draw->info.prim),
+      .point_size_fp16 = vs->info.vs.writes_point_size &&
+                         ia->primitive_topology ==
+                            VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
+      .index_size = draw->info.index.index_size,
+      .restart = ia->primitive_restart_enable,
+      .secondary = secondary_shader,
+   };
 
-      /* draw->info.vertex.base already holds the right value in both
-       * cases -- vertexOffset for CmdDrawIndexed, firstVertex for a
-       * plain CmdDraw (see how each sets up .vertex.base below) -- so
-       * this must NOT be gated on indexing. Only index_type is
-       * conditional: a non-indexed draw has no index buffer, but it
-       * still needs its base vertex applied, exactly like the Bifrost
-       * path does via draw->info.vertex.raw_offset (offset_start).
-       * Leaving this at 0 for non-indexed draws silently drops
-       * firstVertex whenever it's non-zero. */
-      cfg.base_vertex_offset = draw->info.vertex.base;
-
-      if (draw->info.index.index_size)
-         cfg.index_type = translate_index_size(draw->info.index.index_size);
-
-      if (vs->info.vs.writes_point_size &&
-          ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST)
-         cfg.point_size_array_format = MALI_POINT_SIZE_ARRAY_FORMAT_FP16;
-
-      cfg.primitive_restart = ia->primitive_restart_enable;
-      cfg.secondary_shader = secondary_shader;
-   }
+   /* draw->info.vertex.base is vertexOffset for an indexed draw and
+    * firstVertex otherwise. */
+   jm_pack_primitive(ptr.cpu, &prim, draw->info.vertex.count,
+                     draw->info.vertex.base);
 
    pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, INSTANCE_COUNT, cfg) {
       cfg.count = draw->info.instance.count;
@@ -2690,14 +2715,73 @@ panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
          cfg.fixed_sized = 1.0f;
    }
 
+   /* firstIndex: draw->info.index.buffer_dev_addr is the bound index buffer
+    * address (including the vkCmdBindIndexBuffer offset); the first index to
+    * read is `offset` indices further. This used to be ignored, so every
+    * vkCmdDrawIndexed with firstIndex != 0 read the wrong indices. */
+   uint64_t index_addr = draw->info.index.buffer_dev_addr;
+   if (draw->info.index.index_size)
+      index_addr +=
+         (uint64_t)draw->info.index.offset * draw->info.index.index_size;
+
    pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, INDICES, cfg) {
-      cfg.address = draw->info.index.buffer_dev_addr;
+      cfg.address = index_addr;
    }
 
    VkResult result = panvk_emit_fs_draw_v9(
       cmdbuf, draw, pan_section_ptr(ptr.cpu, MALLOC_VERTEX_JOB, DRAW));
    if (result != VK_SUCCESS)
       return result;
+
+   /* The hardware overwrites DRAW.vertex_array (pointer) and the vertex
+    * strides while the job runs. If this command buffer is submitted again,
+    * the stale pointer makes the job fault at once (DATA_INVALID_FAULT 0x58)
+    * -- this is what killed vkmark, which records its command buffers once
+    * and re-submits them every frame. Remember what the CPU wrote so the
+    * queue can restore it before every re-submission. */
+   {
+      uint32_t *draw_words =
+         (uint32_t *)pan_section_ptr(ptr.cpu, MALLOC_VERTEX_JOB, DRAW);
+      struct panvk_jm_draw_fixup draw_fixup = {.words = &draw_words[2]};
+
+      memcpy(draw_fixup.orig, &draw_words[2], sizeof(draw_fixup.orig));
+      util_dynarray_append(&batch->draw_fixups, draw_fixup);
+   }
+
+   if (draw->info.indirect.buffer) {
+      struct panvk_jm_indirect_fixup fixup = {
+         .kind = draw->info.index.index_size ? PANVK_JM_INDIRECT_DRAW_INDEXED
+                                             : PANVK_JM_INDIRECT_DRAW,
+         .buffer = draw->info.indirect.buffer,
+         .offset = draw->info.indirect.offset,
+         .job = ptr.cpu,
+         .draw = {
+            .draw_mode = prim.draw_mode,
+            .point_size_fp16 = prim.point_size_fp16,
+            .index_size = prim.index_size,
+            .primitive_restart = prim.restart,
+            .secondary_shader = prim.secondary,
+            .index_buffer_dev_addr = draw->info.index.buffer_dev_addr,
+         },
+      };
+      panvk_per_arch(jm_job_type_xor)(fixup.type_xor, MALI_JOB_TYPE_NULL,
+                                      MALI_JOB_TYPE_MALLOC_VERTEX);
+
+      if (draw->vs_push_cpu) {
+         uint8_t *fau_cpu = draw->vs_push_cpu;
+
+         if (shader_uses_sysval(vs, graphics, vs.first_vertex))
+            fixup.draw.first_vertex_sysval = (uint32_t *)(fau_cpu +
+               shader_remapped_sysval_offset(
+                  vs, sysval_offset(graphics, vs.first_vertex)));
+         if (shader_uses_sysval(vs, graphics, vs.base_instance))
+            fixup.draw.base_instance_sysval = (uint32_t *)(fau_cpu +
+               shader_remapped_sysval_offset(
+                  vs, sysval_offset(graphics, vs.base_instance)));
+      }
+
+      util_dynarray_append(&batch->indirect_fixups, fixup);
+   }
 
    panvk_emit_vs_position_v9(
       cmdbuf, draw, pan_section_ptr(ptr.cpu, MALLOC_VERTEX_JOB, POSITION));
@@ -2830,6 +2914,7 @@ prepare_draw_v9(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    if (result != VK_SUCCESS)
       return result;
    cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
+   draw->vs_push_cpu = vs_push_uniforms.cpu;
 
    if (fs) {
       struct pan_ptr fs_push_uniforms;
@@ -2840,16 +2925,68 @@ prepare_draw_v9(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
       cmdbuf->state.gfx.fs.push_uniforms = fs_push_uniforms.gpu;
    }
 
-   /* TODO(v9): multi-layer rendering. Only layer 0 is encoded for now, so a
-    * layered render pass renders just its first layer instead of silently
-    * producing a wrong result for all of them. */
-   result = panvk_per_arch(cmd_prepare_tiler_context)(cmdbuf, 0);
+   /* One job per layer (or per multiview view): each layer has its own tiler
+    * context, and the shader reads the layer/view index from the layer_id
+    * sysval, which cmd_prepare_draw_sysvals() fills from draw->info.layer_id. */
+   result = panvk_per_arch(cmd_prepare_tiler_context)(cmdbuf,
+                                                      draw->info.layer_id);
    if (result != VK_SUCCESS)
       return result;
 
    draw->tiler_ctx = &batch->tiler.ctx;
 
    return panvk_draw_prepare_malloc_vertex_job(cmdbuf, draw);
+}
+
+/* Finish a recorded indirect draw once the arguments have been read back from
+ * the indirect buffer (see struct panvk_jm_indirect_fixup).
+ *
+ * VkDrawIndirectCommand        = {vertexCount, instanceCount, firstVertex,
+ *                                 firstInstance}
+ * VkDrawIndexedIndirectCommand = {indexCount, instanceCount, firstIndex,
+ *                                 vertexOffset, firstInstance} */
+bool
+panvk_per_arch(jm_apply_indirect_draw)(struct panvk_jm_indirect_fixup *f,
+                                       const uint32_t *args)
+{
+   const bool indexed = f->kind == PANVK_JM_INDIRECT_DRAW_INDEXED;
+   assert(indexed || f->kind == PANVK_JM_INDIRECT_DRAW);
+
+   const uint32_t count = args[0];
+   const uint32_t instance_count = args[1];
+   const int32_t base_vertex = (int32_t)(indexed ? args[3] : args[2]);
+   const uint32_t first_instance = indexed ? args[4] : args[3];
+
+   if (!count || !instance_count)
+      return false;
+
+   const struct jm_prim_params prim = {
+      .draw_mode = f->draw.draw_mode,
+      .point_size_fp16 = f->draw.point_size_fp16,
+      .index_size = f->draw.index_size,
+      .restart = f->draw.primitive_restart,
+      .secondary = f->draw.secondary_shader,
+   };
+
+   jm_pack_primitive(f->job, &prim, count, base_vertex);
+
+   pan_section_pack(f->job, MALLOC_VERTEX_JOB, INSTANCE_COUNT, cfg) {
+      cfg.count = instance_count;
+   }
+
+   if (indexed) {
+      pan_section_pack(f->job, MALLOC_VERTEX_JOB, INDICES, cfg) {
+         cfg.address = f->draw.index_buffer_dev_addr +
+                       (uint64_t)args[2] * f->draw.index_size;
+      }
+   }
+
+   if (f->draw.first_vertex_sysval)
+      *f->draw.first_vertex_sysval = (uint32_t)base_vertex;
+   if (f->draw.base_instance_sysval)
+      *f->draw.base_instance_sysval = first_instance;
+
+   return true;
 }
 
 static void
@@ -2879,21 +3016,49 @@ panvk_cmd_draw_v9(struct panvk_cmd_buffer *cmdbuf,
    cmdbuf->state.gfx.fs.required =
       fs_required(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state);
 
-   if (prepare_draw_v9(cmdbuf, draw) != VK_SUCCESS)
-      return;
+   /* Per-instance vertex attributes bake firstInstance * stride into their
+    * descriptor offset (see emit_vs_attrib()). Only the CSF path ever set
+    * this, so on Valhall/JM firstInstance was silently ignored for every
+    * instance-rate attribute. For an indirect draw, firstInstance is not
+    * known when recording; drawIndirectFirstInstance is not advertised on
+    * this backend, so it is always 0 there. */
+   cmdbuf->state.gfx.vi.base_instance =
+      draw->info.indirect.buffer ? 0 : (uint32_t)draw->info.instance.base;
 
-   /* PATCH FIX: read cmdbuf->cur_batch only *after* prepare_draw_v9()
-    * returns, not before calling it. prepare_draw_v9() can close the
-    * current batch and open a new one (its job_index-overflow guard),
-    * which repoints cmdbuf->cur_batch; a copy cached before that call
-    * would go stale, and pan_jc_add_job() below would silently link
-    * this draw's job into the old, already-closed batch instead of the
-    * new one -- invisible on any run that doesn't cross that job_index
-    * threshold, but wrong whenever it does. */
-   struct panvk_batch *batch = cmdbuf->cur_batch;
+   uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
+   const uint32_t enabled_layer_count =
+      view_mask ? util_bitcount(view_mask)
+                : MAX2(cmdbuf->state.gfx.render.layer_count, 1);
 
-   pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_MALLOC_VERTEX, false, false, 0,
-                  0, &draw->jobs.idvs, false);
+   for (uint32_t l = 0; l < enabled_layer_count; l++) {
+      draw->info.layer_id = view_mask ? u_bit_scan(&view_mask) : l;
+
+      /* The layer_id sysval lives in the push uniforms, which are re-emitted
+       * for every call below; make sure they are. */
+      if (l > 0)
+         gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+
+      if (prepare_draw_v9(cmdbuf, draw) != VK_SUCCESS)
+         return;
+
+      /* PATCH FIX: read cmdbuf->cur_batch only *after* prepare_draw_v9()
+       * returns, not before calling it. prepare_draw_v9() can close the
+       * current batch and open a new one (its job_index-overflow guard),
+       * which repoints cmdbuf->cur_batch; a copy cached before that call
+       * would go stale, and pan_jc_add_job() below would silently link
+       * this draw's job into the old, already-closed batch instead of the
+       * new one -- invisible on any run that doesn't cross that job_index
+       * threshold, but wrong whenever it does. */
+      struct panvk_batch *batch = cmdbuf->cur_batch;
+
+      /* An indirect draw is recorded as a NULL job: the queue reads the
+       * arguments back and turns it into the real MALLOC_VERTEX job when the
+       * batch is submitted. */
+      pan_jc_add_job(&batch->vtc_jc,
+                     draw->info.indirect.buffer ? MALI_JOB_TYPE_NULL
+                                                : MALI_JOB_TYPE_MALLOC_VERTEX,
+                     false, false, 0, 0, &draw->jobs.idvs, false);
+   }
 
    clear_dirty_after_draw(cmdbuf);
 }
@@ -2958,12 +3123,66 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
    panvk_cmd_draw_v9(cmdbuf, &draw);
 }
 
+static void
+panvk_cmd_draw_indirect_v9(struct panvk_cmd_buffer *cmdbuf,
+                           struct panvk_buffer *buffer, VkDeviceSize offset,
+                           uint32_t drawCount, uint32_t stride, bool indexed)
+{
+   if (drawCount == 0)
+      return;
+
+   /* Same contract as the Bifrost helpers: with an unset index buffer there
+    * is nothing to read for an indexed draw. */
+   if (indexed && !cmdbuf->state.gfx.ib.dev_addr)
+      return;
+
+   const uint32_t cmd_size = indexed ? sizeof(VkDrawIndexedIndirectCommand)
+                                     : sizeof(VkDrawIndirectCommand);
+   if (!stride)
+      stride = cmd_size;
+
+   for (uint32_t i = 0; i < drawCount; i++) {
+      const VkDeviceSize cmd_offset = offset + (VkDeviceSize)i * stride;
+
+      /* Counts are placeholders: they only have to be valid enough for the
+       * descriptors to be built; the real values are patched in when the
+       * batch is submitted. */
+      struct panvk_draw_data draw = {
+         .info = {
+            .index = panvk_draw_info_index(cmdbuf, 0),
+            .vertex.count = 3,
+            .instance.count = 1,
+            .prim = panvk_get_client_prim(cmdbuf),
+            .indirect = {
+               .buffer_dev_addr = panvk_buffer_gpu_ptr(buffer, cmd_offset),
+               .buffer = buffer,
+               .offset = cmd_offset,
+               .draw_count = 1,
+               .stride = stride,
+            },
+         },
+         .vertex_range = 3,
+      };
+
+      if (!indexed) {
+         draw.info.index.buffer_dev_addr = 0;
+         draw.info.index.index_size = 0;
+      }
+
+      panvk_cmd_draw_v9(cmdbuf, &draw);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
                                 VkDeviceSize offset, uint32_t drawCount,
                                 uint32_t stride)
 {
-   /* TODO v9: belum diimplementasikan. */
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+
+   panvk_cmd_draw_indirect_v9(cmdbuf, buffer, offset, drawCount, stride,
+                              false);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2971,7 +3190,11 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
                                        VkBuffer _buffer, VkDeviceSize offset,
                                        uint32_t drawCount, uint32_t stride)
 {
-   /* TODO v9: belum diimplementasikan. */
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+
+   panvk_cmd_draw_indirect_v9(cmdbuf, buffer, offset, drawCount, stride,
+                              true);
 }
 
 VKAPI_ATTR void VKAPI_CALL
