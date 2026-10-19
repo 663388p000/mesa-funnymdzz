@@ -1,5 +1,5 @@
 /*
- * Copyright آ© 2021 Collabora Ltd.
+ * Copyright © 2021 Collabora Ltd.
  * SPDX-License-Identifier: MIT
  */
 
@@ -16,21 +16,13 @@ panvk_per_arch(CreateEvent)(VkDevice _device,
                             VkEvent *pEvent)
 {
    VK_FROM_HANDLE(panvk_device, device, _device);
+
+   /* vk_object_zalloc() leaves the event in the "reset" state. */
    struct panvk_event *event = vk_object_zalloc(
       &device->vk, pAllocator, sizeof(*event), VK_OBJECT_TYPE_EVENT);
    if (!event)
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   struct drm_syncobj_create create = {
-      .flags = 0,
-   };
-
-   int ret = pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_CREATE,
-                            &create);
-   if (ret)
-      return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   event->syncobj = create.handle;
    *pEvent = panvk_event_to_handle(event);
 
    return VK_SUCCESS;
@@ -46,9 +38,6 @@ panvk_per_arch(DestroyEvent)(VkDevice _device, VkEvent _event,
    if (!event)
       return;
 
-   struct drm_syncobj_destroy destroy = {.handle = event->syncobj};
-   pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
-
    vk_object_free(&device->vk, pAllocator, event);
 }
 
@@ -57,47 +46,22 @@ panvk_per_arch(GetEventStatus)(VkDevice _device, VkEvent _event)
 {
    VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
-   bool signaled;
 
-   struct drm_syncobj_wait wait = {
-      .handles = (uintptr_t)&event->syncobj,
-      .count_handles = 1,
-      .timeout_nsec = 0,
-      .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
-   };
+   if (vk_device_is_lost(&device->vk))
+      return VK_ERROR_DEVICE_LOST;
 
-   int ret = pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait);
-   if (ret) {
-      if (errno == ETIME)
-         signaled = false;
-      else {
-         assert(0);
-         return VK_ERROR_DEVICE_LOST; /* TODO */
-      }
-   } else
-      signaled = true;
-
-   return signaled ? VK_EVENT_SET : VK_EVENT_RESET;
+   return panvk_event_is_set(event) ? VK_EVENT_SET : VK_EVENT_RESET;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_per_arch(SetEvent)(VkDevice _device, VkEvent _event)
 {
-   VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
 
-   struct drm_syncobj_array objs = {
-      .handles = (uint64_t)(uintptr_t)&event->syncobj,
-      .count_handles = 1};
-
-   /* This is going to just replace the fence for this syncobj with one that
-    * is already in signaled state. This won't be a problem because the spec
-    * mandates that the event will have been set before the vkCmdWaitEvents
-    * command executes.
-    * https://docs.vulkan.org/spec/latest/chapters/cmdbuffers.html#commandbuffers-submission-progress
-    */
-   if (pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &objs))
-      return VK_ERROR_DEVICE_LOST;
+   /* The spec mandates that the event has been set before any vkCmdWaitEvents
+    * that depends on it executes, so there is nothing to wake up: the queue
+    * polls the flag. */
+   panvk_event_update(event, true);
 
    return VK_SUCCESS;
 }
@@ -105,15 +69,9 @@ panvk_per_arch(SetEvent)(VkDevice _device, VkEvent _event)
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_per_arch(ResetEvent)(VkDevice _device, VkEvent _event)
 {
-   VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
 
-   struct drm_syncobj_array objs = {
-      .handles = (uint64_t)(uintptr_t)&event->syncobj,
-      .count_handles = 1};
-
-   if (pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_RESET, &objs))
-      return VK_ERROR_DEVICE_LOST;
+   panvk_event_update(event, false);
 
    return VK_SUCCESS;
 }
