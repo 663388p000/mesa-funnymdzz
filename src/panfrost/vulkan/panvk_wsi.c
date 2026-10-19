@@ -86,10 +86,10 @@ panvk_can_present_on_device(VkPhysicalDevice pdevice, int fd)
  * records vkCmdCopyImageToBuffer(image -> buffer) and the X11 SHM/PutImage
  * path then reads that buffer from the CPU.
  *
- * On PAN_ARCH >= 9 on the JM backend, compute dispatch is not ported
- * (cmd_dispatch() in jm/panvk_vX_cmd_dispatch.c is a no-op), and
+ * On PAN_ARCH >= 9 on the JM backend, compute dispatch used to be a no-op
+ * (cmd_dispatch() in jm/panvk_vX_cmd_dispatch.c), and
  * CmdCopyImageToBuffer is a vk_meta *compute* copy.  So the copy was
- * silently dropped: the log shows only vertex+fragment atoms, never a
+ * silently dropped: the log showed only vertex+fragment atoms, never a
  * compute job, and the linear present buffer stayed all zeros.
  *
  * Compute dispatch now exists on v9/JM (jm_emit_compute_job), so the blit
