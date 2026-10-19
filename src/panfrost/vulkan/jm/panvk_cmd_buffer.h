@@ -31,10 +31,76 @@
 
 #include "genxml/gen_macros.h"
 
+struct panvk_buffer;
+
+/* Valhall (PAN_ARCH >= 9) MALLOC_VERTEX_JOB: the hardware writes the vertex
+ * array pointer and the vertex strides into the job's DRAW section while the
+ * job runs ("Written by hardware in MallocVertexShader job mode").  When a
+ * command buffer is submitted a second time, the stale values make the job
+ * fault immediately (DATA_INVALID_FAULT, exception 0x58), so we remember what
+ * the CPU originally wrote and put it back before every re-submission. */
+struct panvk_jm_draw_fixup {
+   uint32_t *words; /* &DRAW.word[2] of the job */
+   uint32_t orig[3];
+};
+
+enum panvk_jm_indirect_kind {
+   PANVK_JM_INDIRECT_DISPATCH,
+   PANVK_JM_INDIRECT_DRAW,
+   PANVK_JM_INDIRECT_DRAW_INDEXED,
+};
+
+/* Valhall (PAN_ARCH >= 9) job-manager hardware has no way to read workgroup
+ * counts / draw arguments from memory (the Bifrost patch kernels only know the
+ * Bifrost job layouts).  Like the Gallium driver, we resolve indirect commands
+ * on the CPU: the job is recorded as a NULL job, and when the batch is
+ * submitted -- every earlier atom has already completed, submission is
+ * synchronous -- the arguments are read back, the job is patched and its
+ * type is switched from NULL to the real one. */
+struct panvk_jm_indirect_fixup {
+   enum panvk_jm_indirect_kind kind;
+
+   struct panvk_buffer *buffer;
+   uint64_t offset;
+
+   void *job;               /* job descriptor, CPU pointer */
+   uint32_t type_xor[8];    /* flips the header job type NULL <-> real type */
+   bool enabled;            /* header currently holds the real type */
+
+   union {
+      struct {
+         uint32_t local_size[3];
+         uint64_t res_table;
+         uint64_t spd;
+         uint64_t fau;
+         uint64_t tsd;
+         uint32_t fau_count;
+         bool allow_merging;
+         uint32_t *num_wg_sysval[3]; /* NULL when the shader doesn't use it */
+      } dispatch;
+
+      struct {
+         unsigned draw_mode;
+         bool point_size_fp16;
+         unsigned index_size;
+         bool primitive_restart;
+         bool secondary_shader;
+         uint64_t index_buffer_dev_addr; /* index buffer base address */
+         uint32_t *first_vertex_sysval;  /* NULL when the shader doesn't use it */
+         uint32_t *base_instance_sysval; /* NULL when the shader doesn't use it */
+      } draw;
+   };
+};
+
 struct panvk_batch {
    struct list_head node;
    struct util_dynarray jobs;
    struct util_dynarray event_ops;
+   /* Secondary command buffers executed (vkCmdExecuteCommands) right after
+    * this batch's own work, in order. The queue submits them recursively. */
+   struct util_dynarray exec_cmdbufs; /* struct panvk_cmd_buffer * */
+   struct util_dynarray draw_fixups;     /* struct panvk_jm_draw_fixup */
+   struct util_dynarray indirect_fixups; /* struct panvk_jm_indirect_fixup */
    struct pan_jc vtc_jc;
    struct pan_jc frag_jc;
    struct {
@@ -82,6 +148,9 @@ struct panvk_cmd_buffer {
    struct list_head batches;
    struct list_head push_sets;
    struct panvk_batch *cur_batch;
+
+   /* VkCommandBufferBeginInfo::flags of the current recording. */
+   VkCommandBufferUsageFlags flags;
 
    struct {
       struct panvk_cmd_graphics_state gfx;
@@ -148,5 +217,16 @@ void panvk_per_arch(cmd_bind_shaders)(struct vk_command_buffer *vk_cmd,
                                       uint32_t stage_count,
                                       const mesa_shader_stage *stages,
                                       struct vk_shader **const shaders);
+
+#if PAN_ARCH >= 9 && PAN_ARCH < 10
+/* Apply the arguments read back from an indirect buffer to a recorded
+ * placeholder job. Return true when the job must actually run, false when the
+ * command turns out to be empty (zero workgroups / zero vertices or
+ * instances). */
+bool panvk_per_arch(jm_apply_indirect_dispatch)(
+   struct panvk_jm_indirect_fixup *fixup, const uint32_t *args);
+bool panvk_per_arch(jm_apply_indirect_draw)(
+   struct panvk_jm_indirect_fixup *fixup, const uint32_t *args);
+#endif
 
 #endif
