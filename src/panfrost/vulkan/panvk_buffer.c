@@ -89,6 +89,8 @@ panvk_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
          *bind_status->pResult = VK_SUCCESS;
 
       buffer->vk.device_address = mem->addr.dev + pBindInfos[i].memoryOffset;
+      buffer->mem = mem;
+      buffer->mem_offset = pBindInfos[i].memoryOffset;
 
       panvk_address_binding_report(device, &buffer->vk.base,
                                    buffer->vk.device_address, buffer->vk.size,
