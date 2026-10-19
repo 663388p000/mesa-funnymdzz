@@ -233,6 +233,66 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
  * Without this, every compute-based meta operation was silently dropped:
  * vkCmdCopyBuffer, vkCmdCopyImageToBuffer, vkCmdFillBuffer, ... completed
  * "successfully" and wrote nothing. */
+/* Everything that goes into a COMPUTE_JOB payload. Kept as a plain struct so
+ * the payload can be packed again after an indirect dispatch's workgroup
+ * counts have been read back (see jm_apply_indirect_dispatch()). */
+struct jm_compute_params {
+   uint32_t local_size[3];
+   uint32_t count[3];
+   uint64_t res_table;
+   uint64_t spd;
+   uint64_t fau;
+   uint64_t tsd;
+   uint32_t fau_count;
+   bool allow_merging;
+};
+
+static void
+jm_pack_compute_payload(void *job_cpu, const struct jm_compute_params *p)
+{
+   pan_section_pack(job_cpu, COMPUTE_JOB, PAYLOAD, cfg) {
+      cfg.workgroup_size_x = p->local_size[0];
+      cfg.workgroup_size_y = p->local_size[1];
+      cfg.workgroup_size_z = p->local_size[2];
+
+      cfg.workgroup_count_x = p->count[0];
+      cfg.workgroup_count_y = p->count[1];
+      cfg.workgroup_count_z = p->count[2];
+
+      cfg.compute.resources = p->res_table;
+      cfg.compute.shader = p->spd;
+      cfg.compute.thread_storage = p->tsd;
+      cfg.compute.fau = p->fau;
+      cfg.compute.fau_count = p->fau_count;
+
+      cfg.allow_merging_workgroups = p->allow_merging;
+
+      /* One workgroup per task along Z: always valid, the hardware clamps
+       * the increment to the job size on that axis. */
+      cfg.task_increment = 1;
+      cfg.task_axis = MALI_TASK_AXIS_Z;
+   }
+}
+
+static void
+jm_fill_compute_params(struct jm_compute_params *p,
+                       const struct panvk_shader_variant *cs,
+                       const struct pan_compute_dim *dim, uint64_t res_table,
+                       uint64_t fau_ptr, uint32_t fau_count, uint64_t tsd)
+{
+   *p = (struct jm_compute_params){
+      .local_size = {cs->cs.local_size.x, cs->cs.local_size.y,
+                     cs->cs.local_size.z},
+      .count = {dim->x, dim->y, dim->z},
+      .res_table = res_table,
+      .spd = panvk_priv_mem_dev_addr(cs->spd),
+      .fau = fau_ptr,
+      .tsd = tsd,
+      .fau_count = fau_count,
+      .allow_merging = cs->info.cs.allow_merging_workgroups,
+   };
+}
+
 VkResult
 panvk_per_arch(jm_emit_compute_job)(
    struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *cs,
@@ -249,32 +309,67 @@ panvk_per_arch(jm_emit_compute_job)(
 
    util_dynarray_append(&batch->jobs, job.cpu);
 
-   pan_section_pack(job.cpu, COMPUTE_JOB, PAYLOAD, cfg) {
-      cfg.workgroup_size_x = cs->cs.local_size.x;
-      cfg.workgroup_size_y = cs->cs.local_size.y;
-      cfg.workgroup_size_z = cs->cs.local_size.z;
-
-      cfg.workgroup_count_x = dim->x;
-      cfg.workgroup_count_y = dim->y;
-      cfg.workgroup_count_z = dim->z;
-
-      cfg.compute.resources = res_table;
-      cfg.compute.shader = panvk_priv_mem_dev_addr(cs->spd);
-      cfg.compute.thread_storage = tsd;
-      cfg.compute.fau = fau_ptr;
-      cfg.compute.fau_count = fau_count;
-
-      cfg.allow_merging_workgroups = cs->info.cs.allow_merging_workgroups;
-
-      /* One workgroup per task along Z: always valid, the hardware clamps
-       * the increment to the job size on that axis. */
-      cfg.task_increment = 1;
-      cfg.task_axis = MALI_TASK_AXIS_Z;
-   }
+   struct jm_compute_params params;
+   jm_fill_compute_params(&params, cs, dim, res_table, fau_ptr, fau_count,
+                          tsd);
+   jm_pack_compute_payload(job.cpu, &params);
 
    pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, barrier,
                   suppress_prefetch, local_dep, global_dep, &job, false);
    return VK_SUCCESS;
+}
+
+/* XOR mask that turns a job header of type `a` into one of type `b`
+ * (everything else in the header is identical, so only the type bits are
+ * set). Lets the CPU flip a recorded job between NULL and its real type
+ * without knowing the header's bit layout. */
+void
+panvk_per_arch(jm_job_type_xor)(uint32_t out[8], unsigned a, unsigned b)
+{
+   uint32_t wa[16] = {0}, wb[16] = {0};
+
+   pan_pack(wa, JOB_HEADER, h) {
+      h.type = (enum mali_job_type)a;
+   }
+   pan_pack(wb, JOB_HEADER, h) {
+      h.type = (enum mali_job_type)b;
+   }
+
+   for (unsigned i = 0; i < 8; i++)
+      out[i] = wa[i] ^ wb[i];
+}
+
+bool
+panvk_per_arch(jm_apply_indirect_dispatch)(
+   struct panvk_jm_indirect_fixup *f, const uint32_t *args)
+{
+   assert(f->kind == PANVK_JM_INDIRECT_DISPATCH);
+
+   if (!args[0] || !args[1] || !args[2])
+      return false;
+
+   struct jm_compute_params p = {
+      .local_size = {f->dispatch.local_size[0], f->dispatch.local_size[1],
+                     f->dispatch.local_size[2]},
+      .count = {args[0], args[1], args[2]},
+      .res_table = f->dispatch.res_table,
+      .spd = f->dispatch.spd,
+      .fau = f->dispatch.fau,
+      .tsd = f->dispatch.tsd,
+      .fau_count = f->dispatch.fau_count,
+      .allow_merging = f->dispatch.allow_merging,
+   };
+
+   jm_pack_compute_payload(f->job, &p);
+
+   /* gl_NumWorkGroups lives in the push-uniform block (a fresh block is
+    * allocated per dispatch, so patching it in place is safe). */
+   for (unsigned i = 0; i < 3; i++) {
+      if (f->dispatch.num_wg_sysval[i])
+         *f->dispatch.num_wg_sysval[i] = args[i];
+   }
+
+   return true;
 }
 
 static VkResult
@@ -319,16 +414,10 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
       return;
 
    const bool indirect = info->indirect.buffer_dev_addr != 0;
-   if (indirect) {
-      /* The indirect path patches the job's workgroup counts from a GPU
-       * kernel; that needs the v9 COMPUTE_JOB field offsets and is not
-       * wired up yet.  Say so once instead of failing silently. */
-      static bool warned;
-      if (!warned) {
-         warned = true;
-         mesa_logw("panvk: vkCmdDispatchIndirect is not implemented on "
-                   "Valhall/JM yet; dispatch skipped");
-      }
+   if (indirect && !info->indirect.buffer) {
+      /* The args are read back from the CPU, so we need the VkBuffer, not just
+       * its device address. */
+      mesa_loge("panvk: indirect dispatch without a source buffer; skipped");
       return;
    }
 
@@ -350,8 +439,10 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
       info->direct.wg_count.z,
    };
 
+   /* With indirect=true the WLS instance count is computed for the worst case
+    * since the real workgroup count is only known at submit time. */
    uint64_t tsd =
-      panvk_per_arch(cmd_dispatch_prepare_tls)(cmdbuf, cs, &dim, false);
+      panvk_per_arch(cmd_dispatch_prepare_tls)(cmdbuf, cs, &dim, indirect);
    if (!tsd)
       return;
 
@@ -381,12 +472,71 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    if (result != VK_SUCCESS)
       return;
 
-   result = panvk_per_arch(jm_emit_compute_job)(
-      cmdbuf, cs, &dim, cs_desc_state->res_table,
-      cmdbuf->state.compute.push_uniforms, cs->fau.total_count, tsd,
-      false, false, 0, 0);
-   if (result != VK_SUCCESS)
-      return;
+   if (!indirect) {
+      result = panvk_per_arch(jm_emit_compute_job)(
+         cmdbuf, cs, &dim, cs_desc_state->res_table,
+         cmdbuf->state.compute.push_uniforms, cs->fau.total_count, tsd, false,
+         false, 0, 0);
+      if (result != VK_SUCCESS)
+         return;
+   } else {
+      /* Record the job as a NULL job with placeholder counts and remember
+       * everything needed to finish it when the batch is submitted. */
+      struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
+      if (!job.gpu)
+         return;
+
+      util_dynarray_append(&batch->jobs, job.cpu);
+
+      struct pan_compute_dim placeholder = {1, 1, 1};
+      struct jm_compute_params params;
+      jm_fill_compute_params(&params, cs, &placeholder,
+                             cs_desc_state->res_table,
+                             cmdbuf->state.compute.push_uniforms,
+                             cs->fau.total_count, tsd);
+      jm_pack_compute_payload(job.cpu, &params);
+
+      pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_NULL, false, false, 0, 0,
+                     &job, false);
+
+      struct panvk_jm_indirect_fixup fixup = {
+         .kind = PANVK_JM_INDIRECT_DISPATCH,
+         .buffer = info->indirect.buffer,
+         .offset = info->indirect.offset,
+         .job = job.cpu,
+         .dispatch = {
+            .local_size = {params.local_size[0], params.local_size[1],
+                           params.local_size[2]},
+            .res_table = params.res_table,
+            .spd = params.spd,
+            .fau = params.fau,
+            .tsd = params.tsd,
+            .fau_count = params.fau_count,
+            .allow_merging = params.allow_merging,
+         },
+      };
+      panvk_per_arch(jm_job_type_xor)(fixup.type_xor, MALI_JOB_TYPE_NULL,
+                                      MALI_JOB_TYPE_COMPUTE);
+
+      if (push_uniforms.cpu) {
+         uint8_t *fau_cpu = push_uniforms.cpu;
+
+         if (shader_uses_sysval(cs, compute, num_work_groups.x))
+            fixup.dispatch.num_wg_sysval[0] = (uint32_t *)(fau_cpu +
+               shader_remapped_sysval_offset(
+                  cs, sysval_offset(compute, num_work_groups.x)));
+         if (shader_uses_sysval(cs, compute, num_work_groups.y))
+            fixup.dispatch.num_wg_sysval[1] = (uint32_t *)(fau_cpu +
+               shader_remapped_sysval_offset(
+                  cs, sysval_offset(compute, num_work_groups.y)));
+         if (shader_uses_sysval(cs, compute, num_work_groups.z))
+            fixup.dispatch.num_wg_sysval[2] = (uint32_t *)(fau_cpu +
+               shader_remapped_sysval_offset(
+                  cs, sysval_offset(compute, num_work_groups.z)));
+      }
+
+      util_dynarray_append(&batch->indirect_fixups, fixup);
+   }
 
    panvk_per_arch(cmd_close_batch)(cmdbuf);
    clear_dirty_after_dispatch(cmdbuf);
@@ -420,6 +570,8 @@ panvk_per_arch(CmdDispatchIndirect)(VkCommandBuffer commandBuffer,
    uint64_t buffer_gpu = panvk_buffer_gpu_ptr(buffer, offset);
    struct panvk_dispatch_info info = {
       .indirect.buffer_dev_addr = buffer_gpu,
+      .indirect.buffer = buffer,
+      .indirect.offset = offset,
    };
    cmd_dispatch(cmdbuf, &info);
 }
