@@ -426,6 +426,8 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
 
 void panvk_per_arch(cmd_select_tile_size)(struct panvk_cmd_buffer *cmdbuf);
 
+struct panvk_buffer;
+
 struct panvk_draw_info {
    struct {
       uint64_t buffer_dev_addr;
@@ -453,11 +455,16 @@ struct panvk_draw_info {
       uint64_t count_buffer_dev_addr;
       uint32_t draw_count;
       uint32_t stride;
+      /* Source VkBuffer + offset of the first indirect command. Only set
+       * (and only needed) by the Valhall/JM backend. */
+      struct panvk_buffer *buffer;
+      uint64_t offset;
    } indirect;
 
    enum mesa_prim prim;
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
+   /* Job Manager backends (Bifrost and Valhall/JM) emit one job per layer. */
    uint32_t layer_id;
 #endif
 };
