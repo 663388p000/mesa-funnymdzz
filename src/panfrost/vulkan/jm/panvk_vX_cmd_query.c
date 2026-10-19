@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/log.h"
 #include "util/os_time.h"
 
 #include "libpan_dgc.h"
@@ -124,7 +125,19 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
    UNUSED VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
    UNUSED VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
 
-   panvk_stub();
+   /* Timestamp queries are not exposed by the Job Manager backend:
+    * timestampValidBits is 0 on its queue family, timestampComputeAndGraphics
+    * is false and vkCreateQueryPool() doesn't accept
+    * VK_QUERY_TYPE_TIMESTAMP, so a conforming application never gets here.
+    * Don't abort (panvk_stub() asserts) if a misbehaving one does: warn once
+    * and drop the write. */
+   static bool warned;
+
+   if (!warned) {
+      warned = true;
+      mesa_logw("panvk: vkCmdWriteTimestamp2() is not supported on the Job "
+                "Manager backend (timestampValidBits == 0); ignored");
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -136,7 +149,8 @@ panvk_per_arch(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
 
-   /* TODO: transform feedback */
+   /* Transform feedback queries: VK_EXT_transform_feedback is only exposed
+    * on CSF (PAN_ARCH >= 10), so there is nothing to do here on JM. */
    assert(index == 0);
 
    bool had_batch;
@@ -179,7 +193,8 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
 
-   /* TODO: transform feedback */
+   /* Transform feedback queries: VK_EXT_transform_feedback is only exposed
+    * on CSF (PAN_ARCH >= 10), so there is nothing to do here on JM. */
    assert(index == 0);
 
    bool end_sync = cmd->cur_batch != NULL;
