@@ -144,11 +144,14 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
    uint32_t fau_count =
       DIV_ROUND_UP(BIFROST_PRECOMPILED_KERNEL_SYSVALS_SIZE + data_size, 8);
 
-   /* Precompiled kernels use no resource table. */
+   /* Precompiled kernels use no resource table.
+    *
+    * Every kernel job is emitted with the barrier flag set: it waits for all
+    * the jobs before it in the chain. That is always correct, and it makes the
+    * explicit local/global job dependencies the Bifrost path forwards from
+    * grid.jm unnecessary, so they are not needed here. */
    panvk_per_arch(jm_emit_compute_job)(
-      cmdbuf, shader, &dim, 0, push_uniforms.gpu, fau_count, tsd,
-      (barrier & PANLIB_BARRIER_JM_BARRIER) != 0,
-      (barrier & PANLIB_BARRIER_JM_SUPPRESS_PREFETCH) != 0,
-      grid.jm.local_dep, grid.jm.global_dep);
+      cmdbuf, shader, &dim, 0, push_uniforms.gpu, fau_count, tsd, true,
+      (barrier & PANLIB_BARRIER_JM_SUPPRESS_PREFETCH) != 0, 0, 0);
 }
 #endif
