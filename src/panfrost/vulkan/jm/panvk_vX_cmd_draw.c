@@ -33,7 +33,7 @@
  * struct base_jd_atom v3/64-byte, tanpa pre_dep antar-atom) -- BUKAN lagi
  * stub kosong. Untuk v9 sekarang juga sudah ada: CmdDrawIndirect* (argumen
  * dibaca balik di CPU saat batch disubmit, lihat struct
- * panvk_jm_indirect_fixup) dan multi-layer/multiview (satu job per layer).
+ * panvk_jm_indirect_fixup).
  * Belum ada: drawIndirectCount / multiDrawIndirect (tidak diiklankan di JM)
  * dan firstInstance != 0 pada indirect draw (drawIndirectFirstInstance =
  * false di v9). */
@@ -2547,7 +2547,7 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
  * Yang BELUM ditangani di sini, sengaja, supaya unit ini tetap bisa
  * di-review/di-rollback sendiri:
  *  - indirect draw: lihat panvk_cmd_draw_indirect_v9();
- *  - multi-layer/multiview: satu job per layer (lihat panvk_cmd_draw_v9());
+ *  - multi-layer/multiview: hanya layer 0 yang di-encode;
  *  - transform feedback dan tessellation.
  */
 
@@ -2925,11 +2925,10 @@ prepare_draw_v9(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
       cmdbuf->state.gfx.fs.push_uniforms = fs_push_uniforms.gpu;
    }
 
-   /* One job per layer (or per multiview view): each layer has its own tiler
-    * context, and the shader reads the layer/view index from the layer_id
-    * sysval, which cmd_prepare_draw_sysvals() fills from draw->info.layer_id. */
-   result = panvk_per_arch(cmd_prepare_tiler_context)(cmdbuf,
-                                                      draw->info.layer_id);
+   /* TODO(v9): multi-layer rendering. The layer_id sysval (the Bifrost
+    * "one draw per layer, filter in the VS" scheme) doesn't exist on v9, so
+    * only layer 0 is encoded for now. */
+   result = panvk_per_arch(cmd_prepare_tiler_context)(cmdbuf, 0);
    if (result != VK_SUCCESS)
       return result;
 
@@ -3025,40 +3024,26 @@ panvk_cmd_draw_v9(struct panvk_cmd_buffer *cmdbuf,
    cmdbuf->state.gfx.vi.base_instance =
       draw->info.indirect.buffer ? 0 : (uint32_t)draw->info.instance.base;
 
-   uint32_t view_mask = cmdbuf->state.gfx.render.view_mask;
-   const uint32_t enabled_layer_count =
-      view_mask ? util_bitcount(view_mask)
-                : MAX2(cmdbuf->state.gfx.render.layer_count, 1);
+   if (prepare_draw_v9(cmdbuf, draw) != VK_SUCCESS)
+      return;
 
-   for (uint32_t l = 0; l < enabled_layer_count; l++) {
-      draw->info.layer_id = view_mask ? u_bit_scan(&view_mask) : l;
+   /* PATCH FIX: read cmdbuf->cur_batch only *after* prepare_draw_v9()
+    * returns, not before calling it. prepare_draw_v9() can close the
+    * current batch and open a new one (its job_index-overflow guard),
+    * which repoints cmdbuf->cur_batch; a copy cached before that call
+    * would go stale, and pan_jc_add_job() below would silently link
+    * this draw's job into the old, already-closed batch instead of the
+    * new one -- invisible on any run that doesn't cross that job_index
+    * threshold, but wrong whenever it does. */
+   struct panvk_batch *batch = cmdbuf->cur_batch;
 
-      /* The layer_id sysval lives in the push uniforms, which are re-emitted
-       * for every call below; make sure they are. */
-      if (l > 0)
-         gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
-
-      if (prepare_draw_v9(cmdbuf, draw) != VK_SUCCESS)
-         return;
-
-      /* PATCH FIX: read cmdbuf->cur_batch only *after* prepare_draw_v9()
-       * returns, not before calling it. prepare_draw_v9() can close the
-       * current batch and open a new one (its job_index-overflow guard),
-       * which repoints cmdbuf->cur_batch; a copy cached before that call
-       * would go stale, and pan_jc_add_job() below would silently link
-       * this draw's job into the old, already-closed batch instead of the
-       * new one -- invisible on any run that doesn't cross that job_index
-       * threshold, but wrong whenever it does. */
-      struct panvk_batch *batch = cmdbuf->cur_batch;
-
-      /* An indirect draw is recorded as a NULL job: the queue reads the
-       * arguments back and turns it into the real MALLOC_VERTEX job when the
-       * batch is submitted. */
-      pan_jc_add_job(&batch->vtc_jc,
-                     draw->info.indirect.buffer ? MALI_JOB_TYPE_NULL
-                                                : MALI_JOB_TYPE_MALLOC_VERTEX,
-                     false, false, 0, 0, &draw->jobs.idvs, false);
-   }
+   /* An indirect draw is recorded as a NULL job: the queue reads the
+    * arguments back and turns it into the real MALLOC_VERTEX job when the
+    * batch is submitted. */
+   pan_jc_add_job(&batch->vtc_jc,
+                  draw->info.indirect.buffer ? MALI_JOB_TYPE_NULL
+                                             : MALI_JOB_TYPE_MALLOC_VERTEX,
+                  false, false, 0, 0, &draw->jobs.idvs, false);
 
    clear_dirty_after_draw(cmdbuf);
 }
