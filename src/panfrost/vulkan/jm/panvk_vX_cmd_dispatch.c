@@ -10,6 +10,7 @@
  */
 
 #include <stdint.h>
+#include <string.h>
 #include "genxml/gen_macros.h"
 
 #include "panvk_buffer.h"
@@ -326,14 +327,24 @@ panvk_per_arch(jm_emit_compute_job)(
 void
 panvk_per_arch(jm_job_type_xor)(uint32_t out[8], unsigned a, unsigned b)
 {
-   uint32_t wa[16] = {0}, wb[16] = {0};
+   _Static_assert(sizeof(struct mali_job_header_packed) <=
+                     8 * sizeof(uint32_t),
+                  "the job header no longer fits in the XOR mask");
 
-   pan_pack(wa, JOB_HEADER, h) {
+   /* pan_pack() writes through a pointer to the *packed struct*, so pack into
+    * real struct mali_job_header_packed objects, not raw word arrays. */
+   struct mali_job_header_packed ha, hb;
+   uint32_t wa[8] = {0}, wb[8] = {0};
+
+   pan_pack(&ha, JOB_HEADER, h) {
       h.type = (enum mali_job_type)a;
    }
-   pan_pack(wb, JOB_HEADER, h) {
+   pan_pack(&hb, JOB_HEADER, h) {
       h.type = (enum mali_job_type)b;
    }
+
+   memcpy(wa, &ha, sizeof(ha));
+   memcpy(wb, &hb, sizeof(hb));
 
    for (unsigned i = 0; i < 8; i++)
       out[i] = wa[i] ^ wb[i];
