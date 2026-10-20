@@ -1,4 +1,4 @@
-name: Android NDK Build (Wrapper Variant)
+name: Android NDK Build (termux)
 
 
 on: [push]
