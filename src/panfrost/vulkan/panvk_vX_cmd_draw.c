@@ -1,4 +1,4 @@
- *
+/*
  * Copyright © 2024 Collabora Ltd.
  * Copyright © 2024 Arm Ltd.
  * SPDX-License-Identifier: MIT
