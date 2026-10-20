@@ -463,8 +463,7 @@ struct panvk_draw_info {
 
    enum mesa_prim prim;
 
-#if PAN_ARCH < 10
-   /* Job Manager backends (Bifrost and Valhall/JM) emit one job per layer. */
+#if PAN_ARCH < 9
    uint32_t layer_id;
 #endif
 };
@@ -575,3 +574,4 @@ void panvk_per_arch(cmd_draw_volume)(struct vk_command_buffer *cmd,
 #endif
 
 #endif
+‌
