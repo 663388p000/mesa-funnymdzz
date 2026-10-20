@@ -1,4 +1,4 @@
-/*
+ *
  * Copyright © 2024 Collabora Ltd.
  * Copyright © 2024 Arm Ltd.
  * SPDX-License-Identifier: MIT
@@ -828,8 +828,6 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
 #if PAN_ARCH < 9
    set_gfx_sysval(cmdbuf, dirty_sysvals, vs.raw_vertex_offset,
                   info->vertex.raw_offset);
-#endif
-#if PAN_ARCH < 10
    set_gfx_sysval(cmdbuf, dirty_sysvals, layer_id, info->layer_id);
 #endif
 
