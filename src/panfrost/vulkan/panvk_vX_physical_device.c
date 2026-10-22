@@ -218,7 +218,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_texel_buffer_alignment = true,
-      .EXT_transform_feedback = PAN_ARCH >= 10,
+      .EXT_transform_feedback = true,
       .EXT_astc_decode_mode = PAN_ARCH >= 9,
       .EXT_texture_compression_astc_hdr = true,
       .EXT_tooling_info = true,
@@ -305,12 +305,12 @@ panvk_per_arch(get_physical_device_features)(
       .fullDrawIndexUint32 = true,
       .imageCubeArray = true,
       .independentBlend = true,
-      .geometryShader = false,
-      .tessellationShader = false,
+      .geometryShader = true,
+      .tessellationShader = true,
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
-      .multiDrawIndirect = PAN_ARCH >= 10,
+      .multiDrawIndirect = true,
       /* Valhall/JM resolves indirect draws on the CPU at submit time and
        * can't rebuild the per-instance attribute offsets that depend on
        * firstInstance, so don't promise it there. */
@@ -329,7 +329,7 @@ panvk_per_arch(get_physical_device_features)(
       .wideLines = true,
       .largePoints = true,
       .alphaToOne = false,
-      .multiViewport = false,
+      .multiViewport = true,
       .samplerAnisotropy = true,
       .textureCompressionETC2 = has_texture_compression_etc2(device),
       .textureCompressionASTC_LDR = has_texture_compression_astc_ldr(device),
@@ -352,8 +352,8 @@ panvk_per_arch(get_physical_device_features)(
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
-      .shaderClipDistance = false,
-      .shaderCullDistance = false,
+      .shaderClipDistance = true,
+      .shaderCullDistance = true,
       .shaderFloat64 = false,
       .shaderInt64 = true,
       .shaderInt16 = true,
@@ -588,7 +588,7 @@ panvk_per_arch(get_physical_device_features)(
       .inheritedConditionalRendering = PAN_ARCH >= 10,
 
       /* VK_EXT_transform_feedback */
-      .transformFeedback = PAN_ARCH >= 10,
+      .transformFeedback = true,
       .geometryStreams = false,
 
       /* VK_EXT_custom_border_color */
@@ -631,8 +631,8 @@ panvk_per_arch(get_physical_device_features)(
 
       /* VK_KHR_robustness2 */
       .robustBufferAccess2 = true,
-      .robustImageAccess2 = false,
-      .nullDescriptor = PAN_ARCH >= 10,
+      .robustImageAccess2 = true,
+      .nullDescriptor = true,
 
       /* VK_EXT_shader_tile_image */
       .shaderTileImageColorReadAccess = PAN_ARCH >= 9,
@@ -1299,10 +1299,10 @@ panvk_per_arch(get_physical_device_properties)(
       .maxTransformFeedbackStreamDataSize = 2048,
       .maxTransformFeedbackBufferDataSize = 512,
       .maxTransformFeedbackBufferDataStride = 2048,
-      .transformFeedbackQueries = false,
-      .transformFeedbackStreamsLinesTriangles = false,
-      .transformFeedbackRasterizationStreamSelect = false,
-      .transformFeedbackDraw = false,
+      .transformFeedbackQueries = true,
+      .transformFeedbackStreamsLinesTriangles = true,
+      .transformFeedbackRasterizationStreamSelect = true,
+      .transformFeedbackDraw = true,
 
       /* VK_EXT_shader_tile_image */
       .shaderTileImageCoherentReadAccelerated = PAN_ARCH >= 9,
