@@ -51,14 +51,14 @@ panvk_per_arch(get_physical_device_extensions)(
          device->kmod.dev->props.gpu_can_query_timestamp,
       .KHR_compute_shader_derivatives = PAN_ARCH >= 9,
       .KHR_copy_commands2 = true,
-      .KHR_copy_memory_indirect = PAN_ARCH >= 10,
+      .KHR_copy_memory_indirect = PAN_ARCH >= 9,
       .KHR_create_renderpass2 = true,
       .KHR_dedicated_allocation = true,
       .KHR_descriptor_update_template = true,
       .KHR_depth_clamp_zero_one = true,
       .KHR_depth_stencil_resolve = true,
       .KHR_device_group = true,
-      .KHR_draw_indirect_count = PAN_ARCH >= 10,
+      .KHR_draw_indirect_count = PAN_ARCH >= 9,
       .KHR_driver_properties = true,
       .KHR_dynamic_rendering = true,
       .KHR_dynamic_rendering_local_read = true,
@@ -75,18 +75,18 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_imageless_framebuffer = true,
       .KHR_index_type_uint8 = true,
       .KHR_internally_synchronized_queues = true,
-      .KHR_line_rasterization = true,
-      .KHR_load_store_op_none = true,
+      .KHR_line_rasterization = PAN_ARCH >= 9,
+      .KHR_load_store_op_none = PAN_ARCH >= 9,
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
       .KHR_maintenance4 = true,
-      .KHR_maintenance5 = true,
-      .KHR_maintenance6 = true,
-      .KHR_maintenance7 = true,
-      .KHR_maintenance8 = true,
-      .KHR_maintenance9 = true,
-      .KHR_map_memory2 = true,
+      .KHR_maintenance5 = PAN_ARCH >= 9,
+      .KHR_maintenance6 = PAN_ARCH >= 9,
+      .KHR_maintenance7 = PAN_ARCH >= 9,
+      .KHR_maintenance8 = PAN_ARCH >= 9,
+      .KHR_maintenance9 = PAN_ARCH >= 9,
+      .KHR_map_memory2 = PAN_ARCH >= 9,
       .KHR_multiview = true,
       .KHR_pipeline_binary = true,
       .KHR_pipeline_executable_properties = true,
@@ -141,7 +141,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_buffer_device_address = true,
       .EXT_calibrated_timestamps =
          device->kmod.dev->props.gpu_can_query_timestamp,
-      .EXT_conditional_rendering = PAN_ARCH >= 10,
+      .EXT_conditional_rendering = PAN_ARCH >= 9,
       .EXT_color_write_enable = true,
       .EXT_conservative_rasterization = PAN_ARCH >= 11,
       .EXT_custom_border_color = true,
@@ -180,7 +180,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_line_rasterization = true,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
-      .EXT_nested_command_buffer = PAN_ARCH >= 10,
+      .EXT_nested_command_buffer = PAN_ARCH >= 9,
       .EXT_memory_budget = true,
       .EXT_non_seamless_cube_map = true,
       .EXT_mutable_descriptor_type = PAN_ARCH >= 9,
@@ -197,10 +197,10 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_primitive_topology_list_restart = true,
       .EXT_provoking_vertex = true,
       .EXT_queue_family_foreign = true,
-      .EXT_rasterization_order_attachment_access = PAN_ARCH >= 10,
+      .EXT_rasterization_order_attachment_access = PAN_ARCH >= 9,
       .EXT_rgba10x6_formats = PAN_ARCH >= 11,
       .EXT_robustness2 = true,
-      .EXT_sampler_filter_minmax = PAN_ARCH >= 10,
+      .EXT_sampler_filter_minmax = PAN_ARCH >= 9,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
       .EXT_shader_atomic_float = true,
@@ -224,8 +224,8 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_tooling_info = true,
       .EXT_vertex_attribute_divisor = true,
       .EXT_vertex_input_dynamic_state = true,
-      .EXT_ycbcr_2plane_444_formats = PAN_ARCH >= 10,
-      .EXT_ycbcr_image_arrays = PAN_ARCH >= 10,
+      .EXT_ycbcr_2plane_444_formats = PAN_ARCH >= 9,
+      .EXT_ycbcr_image_arrays = PAN_ARCH >= 9,
       .EXT_zero_initialize_device_memory = true,
       .EXT_inline_uniform_block = true,
       .ANDROID_external_memory_android_hardware_buffer = has_gralloc,
@@ -242,7 +242,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .ARM_shader_core_builtins = true,
       .ARM_shader_core_properties = true,
       .ARM_scheduling_controls = true,
-      .ARM_rasterization_order_attachment_access = PAN_ARCH >= 10,
+      .ARM_rasterization_order_attachment_access = PAN_ARCH >= 9,
    };
 }
 
@@ -387,13 +387,13 @@ panvk_per_arch(get_physical_device_features)(
 
       /* Vulkan 1.2 */
       .samplerMirrorClampToEdge = true,
-      .drawIndirectCount = PAN_ARCH >= 10,
+      .drawIndirectCount = PAN_ARCH >= 9,
       .storageBuffer8BitAccess = true,
       .uniformAndStorageBuffer8BitAccess = true,
       .storagePushConstant8 = true,
       .shaderBufferInt64Atomics = PAN_ARCH >= 9,
       .shaderSharedInt64Atomics = PAN_ARCH >= 9,
-      .shaderFloat16 = PAN_ARCH >= 10,
+      .shaderFloat16 = PAN_ARCH >= 9,
       .shaderInt8 = true,
       /* In theory, update-after-bind is supported on bifrost, but the
        * descriptor limits would be too low for the descriptorIndexing feature.
@@ -419,7 +419,7 @@ panvk_per_arch(get_physical_device_features)(
       .descriptorBindingPartiallyBound = PAN_ARCH >= 9,
       .descriptorBindingVariableDescriptorCount = true,
       .runtimeDescriptorArray = true,
-      .samplerFilterMinmax = PAN_ARCH >= 10,
+      .samplerFilterMinmax = PAN_ARCH >= 9,
       .scalarBlockLayout = true,
       .imagelessFramebuffer = true,
       .uniformBufferStandardLayout = true,
@@ -454,7 +454,7 @@ panvk_per_arch(get_physical_device_features)(
       .shaderZeroInitializeWorkgroupMemory = true,
 
       /* VK_EXT_astc_decode_mode */
-      .decodeModeSharedExponent = false,
+      .decodeModeSharedExponent = PAN_ARCH >= 9,
 
       .dynamicRendering = true,
       .shaderIntegerDotProduct = true,
@@ -581,11 +581,11 @@ panvk_per_arch(get_physical_device_features)(
       .colorWriteEnable = true,
 
       /* VK_KHR_copy_memory_indirect */
-      .indirectMemoryCopy = PAN_ARCH >= 10,
+      .indirectMemoryCopy = PAN_ARCH >= 9,
 
       /* VK_EXT_conditional_rendering */
-      .conditionalRendering = PAN_ARCH >= 10,
-      .inheritedConditionalRendering = PAN_ARCH >= 10,
+      .conditionalRendering = PAN_ARCH >= 9,
+      .inheritedConditionalRendering = PAN_ARCH >= 9,
 
       /* VK_EXT_transform_feedback */
       .transformFeedback = true,
@@ -698,18 +698,18 @@ panvk_per_arch(get_physical_device_features)(
       .formatRgba10x6WithoutYCbCrSampler = PAN_ARCH >= 11,
 
       /* VK_EXT_ycbcr_2plane_444_formats */
-      .ycbcr2plane444Formats = PAN_ARCH >= 10,
+      .ycbcr2plane444Formats = PAN_ARCH >= 9,
 
       /* VK_EXT_ycbcr_image_arrays */
-      .ycbcrImageArrays = PAN_ARCH >= 10,
+      .ycbcrImageArrays = PAN_ARCH >= 9,
 
       /* VK_EXT_legacy_dithering */
       .legacyDithering = true,
 
       /* VK_EXT_nested_command_buffer */
-      .nestedCommandBuffer = PAN_ARCH >= 10,
-      .nestedCommandBufferRendering = PAN_ARCH >= 10,
-      .nestedCommandBufferSimultaneousUse = PAN_ARCH >= 10,
+      .nestedCommandBuffer = PAN_ARCH >= 9,
+      .nestedCommandBufferRendering = PAN_ARCH >= 9,
+      .nestedCommandBufferSimultaneousUse = PAN_ARCH >= 9,
 
       /* VK_EXT_map_memory_placed */
       .memoryMapPlaced = true,
@@ -731,7 +731,7 @@ panvk_per_arch(get_physical_device_features)(
       .mutableDescriptorType = PAN_ARCH >= 9,
 
       /* VK_KHR_shader_fma */
-      .shaderFmaFloat16 = PAN_ARCH >= 10,
+      .shaderFmaFloat16 = PAN_ARCH >= 9,
       .shaderFmaFloat32 = true,
       .shaderFmaFloat64 = false,
 
@@ -777,9 +777,9 @@ panvk_per_arch(get_physical_device_features)(
 #endif
 
       /* VK_EXT_rasterization_order_attachment_access */
-      .rasterizationOrderColorAttachmentAccess = PAN_ARCH >= 10,
-      .rasterizationOrderDepthAttachmentAccess = PAN_ARCH >= 10,
-      .rasterizationOrderStencilAttachmentAccess = PAN_ARCH >= 10,
+      .rasterizationOrderColorAttachmentAccess = PAN_ARCH >= 9,
+      .rasterizationOrderDepthAttachmentAccess = PAN_ARCH >= 9,
+      .rasterizationOrderStencilAttachmentAccess = PAN_ARCH >= 9,
    };
 }
 
@@ -1139,8 +1139,8 @@ panvk_per_arch(get_physical_device_properties)(
                                       VK_RESOLVE_MODE_MAX_BIT,
       .independentResolveNone = true,
       .independentResolve = true,
-      .filterMinmaxSingleComponentFormats = PAN_ARCH >= 10,
-      .filterMinmaxImageComponentMapping = PAN_ARCH >= 10,
+      .filterMinmaxSingleComponentFormats = PAN_ARCH >= 9,
+      .filterMinmaxImageComponentMapping = PAN_ARCH >= 9,
       .maxTimelineSemaphoreValueDifference = INT64_MAX,
       .framebufferIntegerColorSampleCounts = sample_counts,
 
