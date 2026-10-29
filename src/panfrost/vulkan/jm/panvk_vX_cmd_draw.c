@@ -2368,6 +2368,49 @@ writes_depth_v9(struct panvk_cmd_buffer *cmdbuf)
           ds->depth.write_enable && ds->depth.compare_op != VK_COMPARE_OP_NEVER;
 }
 
+static bool
+writes_stencil_v9(struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct vk_depth_stencil_state *ds =
+      &cmdbuf->vk.dynamic_graphics_state.ds;
+
+   return has_stencil_att_v9(cmdbuf) && ds->stencil.test_enable &&
+          ((ds->stencil.front.write_mask &&
+            (ds->stencil.front.op.fail != VK_STENCIL_OP_KEEP ||
+             ds->stencil.front.op.pass != VK_STENCIL_OP_KEEP ||
+             ds->stencil.front.op.depth_fail != VK_STENCIL_OP_KEEP)) ||
+           (ds->stencil.back.write_mask &&
+            (ds->stencil.back.op.fail != VK_STENCIL_OP_KEEP ||
+             ds->stencil.back.op.pass != VK_STENCIL_OP_KEEP ||
+             ds->stencil.back.op.depth_fail != VK_STENCIL_OP_KEEP)));
+}
+
+/* True when neither the depth test nor the stencil test can reject a
+ * fragment. Unlike the Bifrost helper this also looks at stencil-only
+ * attachments. */
+static bool
+ds_test_always_passes_v9(struct panvk_cmd_buffer *cmdbuf)
+{
+   const struct vk_depth_stencil_state *ds =
+      &cmdbuf->vk.dynamic_graphics_state.ds;
+   const bool has_z = has_depth_att_v9(cmdbuf);
+   const bool has_s = has_stencil_att_v9(cmdbuf);
+
+   if (!has_z && !has_s)
+      return true;
+
+   if (has_z && ds->depth.test_enable &&
+       ds->depth.compare_op != VK_COMPARE_OP_ALWAYS)
+      return false;
+
+   if (has_s && ds->stencil.test_enable &&
+       (ds->stencil.front.op.compare != VK_COMPARE_OP_ALWAYS ||
+        ds->stencil.back.op.compare != VK_COMPARE_OP_ALWAYS))
+      return false;
+
+   return true;
+}
+
 static inline enum mali_func
 translate_compare_func_v9(VkCompareOp comp)
 {
@@ -2405,6 +2448,8 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
                       struct mali_draw_packed *dcd)
 {
    struct panvk_shader_desc_state *fs_desc_state = &cmdbuf->state.gfx.fs.desc;
+   const struct vk_dynamic_graphics_state *dyns =
+      &cmdbuf->vk.dynamic_graphics_state;
    const struct vk_rasterization_state *rs =
       &cmdbuf->vk.dynamic_graphics_state.rs;
    const struct vk_depth_stencil_state *ds =
@@ -2416,16 +2461,37 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
    bool test_s = has_stencil_att_v9(cmdbuf) && ds->stencil.test_enable;
    bool test_z = has_depth_att_v9(cmdbuf) && ds->depth.test_enable;
    bool writes_z = writes_depth_v9(cmdbuf);
+   bool writes_s = writes_stencil_v9(cmdbuf);
+
+   /* get_fs() is NULL when the pipeline has no fragment shader (depth-only
+    * passes) or when the fragment shader isn't needed for this draw. The
+    * original code dereferenced it unconditionally here, which crashed every
+    * depth/stencil-only draw (SIGSEGV on a NULL variant pointer). Same
+    * convention as the CSF path: no fragment shader -> blend disabled, no
+    * fragment shader environment. */
+   const struct panvk_shader_variant *fs =
+      panvk_shader_only_variant(get_fs(cmdbuf));
 
    if (bd_count > 0) {
       blend_ptr = panvk_cmd_alloc_desc_array(cmdbuf, bd_count, BLEND);
       if (!blend_ptr.gpu)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-      VkResult result =
-         panvk_per_arch(blend_emit_descs)(cmdbuf, blend_ptr.cpu);
-      if (result != VK_SUCCESS)
-         return result;
+      if (fs) {
+         VkResult result =
+            panvk_per_arch(blend_emit_descs)(cmdbuf, blend_ptr.cpu);
+         if (result != VK_SUCCESS)
+            return result;
+      } else {
+         struct mali_blend_packed *bds = blend_ptr.cpu;
+
+         for (unsigned i = 0; i < bd_count; i++) {
+            pan_pack(&bds[i], BLEND, cfg) {
+               cfg.enable = false;
+               cfg.internal.mode = MALI_BLEND_MODE_OFF;
+            }
+         }
+      }
    }
 
    struct pan_ptr ds_ptr = panvk_cmd_alloc_desc(cmdbuf, DEPTH_STENCIL);
@@ -2480,6 +2546,69 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
       }
    }
 
+   /* Per-draw pixel pipeline state. This mirrors the DCD flags the CSF path
+    * (emit_dcd_flags) and the Bifrost RENDERER_STATE path above compute; only
+    * fields that are known to exist in the v9 MALI_DRAW (they are used by
+    * panvk_vX_cmd_frame_shaders.c, which is built for v9 too) are set. */
+   const bool alpha_to_coverage = dyns->ms.alpha_to_coverage_enable;
+   const uint8_t rt_mask = cmdbuf->state.gfx.render.bound_attachments &
+                           MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
+   const bool oq = cmdbuf->state.gfx.occlusion_query.mode !=
+                   MALI_OCCLUSION_MODE_DISABLED;
+   uint8_t rt_written = 0;
+   bool allow_fpk = true;
+   bool allow_fpk_killed = true;
+   bool eval_per_sample = false;
+   enum mali_pixel_kill pixel_kill = MALI_PIXEL_KILL_FORCE_EARLY;
+   enum mali_pixel_kill zs_update = MALI_PIXEL_KILL_FORCE_EARLY;
+
+   bool msaa = dyns->ms.rasterization_samples > 1;
+   if (reduced_prim == MESA_PRIM_LINES &&
+       rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM) {
+      /* Bresenham lines are rasterized at the pixel center, MSAA has to be
+       * off for them (same rule as the other backends). */
+      msaa = false;
+   }
+
+   if (fs) {
+      const bool roa_color =
+         dyns->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT;
+      const bool roa_zs = dyns->rasterization_order_access &
+                          (VK_IMAGE_ASPECT_DEPTH_BIT |
+                           VK_IMAGE_ASPECT_STENCIL_BIT);
+
+      rt_written = color_attachment_written_mask(fs, &dyns->cal);
+      const uint8_t rt_read =
+         color_attachment_read_mask(fs, &dyns->ial, rt_mask);
+
+      enum pan_earlyzs_zs_tilebuf_read zs_read =
+         (roa_zs || z_attachment_read(fs, &dyns->ial) ||
+          s_attachment_read(fs, &dyns->ial))
+            ? PAN_EARLYZS_ZS_TILEBUF_READ_NO_OPT
+            : PAN_EARLYZS_ZS_TILEBUF_NOT_READ;
+
+      allow_fpk = fs->info.fs.can_fpk && !(rt_mask & ~rt_written) &&
+                  !(rt_read & rt_written) && !alpha_to_coverage &&
+                  !cmdbuf->state.gfx.cb.info.any_dest_read && !roa_color;
+      allow_fpk_killed = !fs->info.writes_global;
+
+      const bool writes_zs = writes_z || writes_s;
+      const bool zs_always_passes = ds_test_always_passes_v9(cmdbuf);
+      struct pan_earlyzs_state earlyzs =
+         pan_earlyzs_get(fs->fs.earlyzs_lut, writes_zs || oq,
+                         alpha_to_coverage, zs_always_passes, zs_read);
+
+      pixel_kill = (enum mali_pixel_kill)earlyzs.kill;
+      zs_update = (enum mali_pixel_kill)earlyzs.update;
+
+      /* Per-sample shading is required by the API, and also when a blend
+       * shader is used with MSAA (handled by a single ST_TILE in the blend
+       * shader with the current sample id). */
+      eval_per_sample = (fs->info.fs.sample_shading ||
+                         cmdbuf->state.gfx.cb.info.needs_shader) &&
+                        dyns->ms.rasterization_samples > 1;
+   }
+
    pan_pack(dcd, DRAW, cfg) {
       cfg.flags_0.front_face_ccw = rs->front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
       cfg.flags_0.cull_front_face =
@@ -2487,25 +2616,25 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
       cfg.flags_0.cull_back_face =
          !non_polygon && (rs->cull_mode & VK_CULL_MODE_BACK_BIT) != 0;
 
+      cfg.flags_0.allow_forward_pixel_to_kill = allow_fpk;
+      cfg.flags_0.allow_forward_pixel_to_be_killed = allow_fpk_killed;
+      cfg.flags_0.pixel_kill_operation = pixel_kill;
+      cfg.flags_0.zs_update_operation = zs_update;
+      cfg.flags_0.multisample_enable = msaa;
+      cfg.flags_0.evaluate_per_sample = eval_per_sample;
+
+      /* The occlusion *pointer* alone does nothing: without the mode every
+       * occlusion query silently stays at zero. */
+      cfg.flags_0.occlusion_query = cmdbuf->state.gfx.occlusion_query.mode;
       cfg.occlusion = cmdbuf->state.gfx.occlusion_query.ptr;
 
-      /* PATCH v9 Draw.flags_1: TIDAK ADA referensi Bifrost/GL langsung
-       * (field ini spesifik Valhall, nol pemakaian di tree Mesa manapun).
-       * Nilai dipetakan by-analogy dari konsep yang sama yang dipakai
-       * Bifrost RENDERER_STATE (sample_mask dari dynamic state MSAA,
-       * render_target_mask dari bound color attachments) -- BUKAN reuse
-       * kode existing, karena strukturnya beda total. Paling perlu
-       * dicurigai duluan kalau ada hasil aneh di rendering nanti. */
-      cfg.flags_1.sample_mask = cmdbuf->vk.dynamic_graphics_state.ms.sample_mask;
-      cfg.flags_1.render_target_mask =
-         cmdbuf->state.gfx.render.bound_attachments &
-         MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
+      cfg.flags_1.sample_mask = dyns->ms.sample_mask;
+      cfg.flags_1.render_target_mask = rt_written;
 
       /* PATCH v9 Draw.vertex_array: genxml comment eksplisit bilang
        * Pointer/stride "Written by hardware in MallocVertexShader job
        * mode" -- CPU cuma perlu set packet=true, sisanya diisi hardware
-       * otomatis. Belum ada 1 pun kode Mesa lain yang pernah nyentuh
-       * field ini buat dijadiin referensi silang. */
+       * otomatis. */
       cfg.vertex_array.packet = true;
 
       cfg.minimum_z = minz;
@@ -2516,14 +2645,14 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
       cfg.blend_count = bd_count;
       cfg.blend = blend_ptr.gpu;
 
-      cfg.shader.resources = fs_desc_state->res_table;
-      cfg.shader.shader = panvk_priv_mem_dev_addr(
-         panvk_shader_only_variant(get_fs(cmdbuf))->spd);
-      cfg.shader.thread_storage = draw->tls;
-      cfg.shader.fau = cmdbuf->state.gfx.fs.push_uniforms;
-      /* See the comment in panvk_emit_vs_position_v9(). */
-      cfg.shader.fau_count =
-         panvk_shader_only_variant(get_fs(cmdbuf))->fau.total_count;
+      if (fs) {
+         cfg.shader.resources = fs_desc_state->res_table;
+         cfg.shader.shader = panvk_priv_mem_dev_addr(fs->spd);
+         cfg.shader.thread_storage = draw->tls;
+         cfg.shader.fau = cmdbuf->state.gfx.fs.push_uniforms;
+         /* See the comment in panvk_emit_vs_position_v9(). */
+         cfg.shader.fau_count = fs->fau.total_count;
+      }
    }
 
    return VK_SUCCESS;
@@ -2754,6 +2883,9 @@ panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
                                              : PANVK_JM_INDIRECT_DRAW,
          .buffer = draw->info.indirect.buffer,
          .offset = draw->info.indirect.offset,
+         .count_buffer = draw->info.indirect.count_buffer,
+         .count_offset = draw->info.indirect.count_offset,
+         .count_index = draw->info.indirect.count_index,
          .job = ptr.cpu,
          .draw = {
             .draw_mode = prim.draw_mode,
@@ -3111,7 +3243,9 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
 static void
 panvk_cmd_draw_indirect_v9(struct panvk_cmd_buffer *cmdbuf,
                            struct panvk_buffer *buffer, VkDeviceSize offset,
-                           uint32_t drawCount, uint32_t stride, bool indexed)
+                           uint32_t drawCount, uint32_t stride, bool indexed,
+                           struct panvk_buffer *count_buffer,
+                           VkDeviceSize count_offset)
 {
    if (drawCount == 0)
       return;
@@ -3131,7 +3265,9 @@ panvk_cmd_draw_indirect_v9(struct panvk_cmd_buffer *cmdbuf,
 
       /* Counts are placeholders: they only have to be valid enough for the
        * descriptors to be built; the real values are patched in when the
-       * batch is submitted. */
+       * batch is submitted. For the *IndirectCount variants, drawCount is
+       * maxDrawCount and the placeholders past the real count are turned
+       * into NULL jobs at that point. */
       struct panvk_draw_data draw = {
          .info = {
             .index = panvk_draw_info_index(cmdbuf, 0),
@@ -3144,6 +3280,9 @@ panvk_cmd_draw_indirect_v9(struct panvk_cmd_buffer *cmdbuf,
                .offset = cmd_offset,
                .draw_count = 1,
                .stride = stride,
+               .count_buffer = count_buffer,
+               .count_offset = count_offset,
+               .count_index = i,
             },
          },
          .vertex_range = 3,
@@ -3167,7 +3306,7 @@ panvk_per_arch(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
    VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
 
    panvk_cmd_draw_indirect_v9(cmdbuf, buffer, offset, drawCount, stride,
-                              false);
+                              false, NULL, 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -3178,8 +3317,40 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
    VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
 
-   panvk_cmd_draw_indirect_v9(cmdbuf, buffer, offset, drawCount, stride,
-                              true);
+   panvk_cmd_draw_indirect_v9(cmdbuf, buffer, offset, drawCount, stride, true,
+                              NULL, 0);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndirectCount)(VkCommandBuffer commandBuffer,
+                                     VkBuffer _buffer, VkDeviceSize offset,
+                                     VkBuffer countBuffer,
+                                     VkDeviceSize countBufferOffset,
+                                     uint32_t maxDrawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+   VK_FROM_HANDLE(panvk_buffer, count_buffer, countBuffer);
+
+   panvk_cmd_draw_indirect_v9(cmdbuf, buffer, offset, maxDrawCount, stride,
+                              false, count_buffer, countBufferOffset);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndexedIndirectCount)(VkCommandBuffer commandBuffer,
+                                            VkBuffer _buffer,
+                                            VkDeviceSize offset,
+                                            VkBuffer countBuffer,
+                                            VkDeviceSize countBufferOffset,
+                                            uint32_t maxDrawCount,
+                                            uint32_t stride)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+   VK_FROM_HANDLE(panvk_buffer, count_buffer, countBuffer);
+
+   panvk_cmd_draw_indirect_v9(cmdbuf, buffer, offset, maxDrawCount, stride,
+                              true, count_buffer, countBufferOffset);
 }
 
 VKAPI_ATTR void VKAPI_CALL
