@@ -1158,6 +1158,12 @@ panvk_jm_map_indirect_args(struct panvk_device *dev,
 static void
 panvk_jm_resolve_indirect(struct panvk_device *dev, struct panvk_batch *batch)
 {
+   /* vkCmdDraw*IndirectCount records maxDrawCount fixups that all share the
+    * same count word; read it once instead of once per recorded draw. */
+   const struct panvk_buffer *cached_count_buffer = NULL;
+   uint64_t cached_count_offset = 0;
+   uint32_t cached_draw_count = 0;
+
    util_dynarray_foreach(&batch->indirect_fixups,
                          struct panvk_jm_indirect_fixup, f) {
       uint32_t args[5] = {0};
@@ -1177,12 +1183,48 @@ panvk_jm_resolve_indirect(struct panvk_device *dev, struct panvk_batch *batch)
 
       void *unmap_base;
       size_t unmap_size;
-      const uint32_t *src = panvk_jm_map_indirect_args(
-         dev, f->buffer, f->offset, nwords * sizeof(uint32_t), &unmap_base,
-         &unmap_size);
+
+      /* vkCmdDraw*IndirectCount: draws past the count stored in the count
+       * buffer are skipped without even looking at their arguments (those
+       * may legitimately lie outside the buffer). */
+      bool past_count = false;
+      if (f->count_buffer) {
+         if (cached_count_buffer != f->count_buffer ||
+             cached_count_offset != f->count_offset) {
+            const uint32_t *csrc = panvk_jm_map_indirect_args(
+               dev, f->count_buffer, f->count_offset, sizeof(uint32_t),
+               &unmap_base, &unmap_size);
+
+            cached_count_buffer = f->count_buffer;
+            cached_count_offset = f->count_offset;
+            cached_draw_count = 0;
+
+            if (csrc) {
+               cached_draw_count = *csrc;
+
+               if (unmap_base) {
+                  struct panvk_device_memory *cmem = f->count_buffer->mem;
+                  pan_kmod_bo_munmap(cmem->bo, unmap_base, unmap_size);
+               }
+            } else {
+               mesa_loge("panvk: couldn't read back the indirect draw count; "
+                         "draws skipped");
+            }
+         }
+
+         past_count = f->count_index >= cached_draw_count;
+      }
+
+      const uint32_t *src = NULL;
+      if (!past_count)
+         src = panvk_jm_map_indirect_args(dev, f->buffer, f->offset,
+                                          nwords * sizeof(uint32_t),
+                                          &unmap_base, &unmap_size);
 
       bool run = false;
-      if (src) {
+      if (past_count) {
+         /* Nothing to run. */
+      } else if (src) {
          memcpy(args, src, nwords * sizeof(uint32_t));
 
          if (unmap_base) {
