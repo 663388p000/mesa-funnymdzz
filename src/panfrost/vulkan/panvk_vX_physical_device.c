@@ -58,6 +58,8 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_depth_clamp_zero_one = true,
       .KHR_depth_stencil_resolve = true,
       .KHR_device_group = true,
+      /* v9 (JM): resolved on the CPU at submit time, see
+       * panvk_jm_resolve_indirect(); not available on v6/v7. */
       .KHR_draw_indirect_count = PAN_ARCH >= 9,
       .KHR_driver_properties = true,
       .KHR_dynamic_rendering = true,
@@ -141,9 +143,13 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_buffer_device_address = true,
       .EXT_calibrated_timestamps =
          device->kmod.dev->props.gpu_can_query_timestamp,
-      .EXT_conditional_rendering = PAN_ARCH >= 9,
+      /* Only the CSF backend implements CmdBegin/EndConditionalRendering. */
+      .EXT_conditional_rendering = PAN_ARCH >= 10,
       .EXT_color_write_enable = true,
-      .EXT_conservative_rasterization = PAN_ARCH >= 9,
+      /* The DCD conservative-rasterization mode only exists on v11+ (see
+       * the DRAW setup in csf/panvk_vX_cmd_draw.c); on v9/v10 the extension
+       * would be advertised without doing anything. */
+      .EXT_conservative_rasterization = PAN_ARCH >= 11,
       .EXT_custom_border_color = true,
       .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
@@ -218,7 +224,11 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_texel_buffer_alignment = true,
-      .EXT_transform_feedback = true,
+      /* The software XFB path (XFB vertex-shader variant + one compute
+       * launch per draw) only exists on CSF. On the Job Manager backend the
+       * entrypoints are missing, so advertising it ends in a call through a
+       * NULL function pointer. */
+      .EXT_transform_feedback = PAN_ARCH >= 10,
       .EXT_astc_decode_mode = PAN_ARCH >= 9,
       .EXT_texture_compression_astc_hdr = true,
       .EXT_tooling_info = true,
@@ -305,31 +315,33 @@ panvk_per_arch(get_physical_device_features)(
       .fullDrawIndexUint32 = true,
       .imageCubeArray = true,
       .independentBlend = true,
-      .geometryShader = true,
-      .tessellationShader = true,
+      /* There is no GS/tessellation lowering in the compiler pipeline: the
+       * Bifrost backend hits 'Unhandled intrinsic load_per_vertex_input'
+       * and crashes. Don't promise what can't be compiled. */
+      .geometryShader = false,
+      .tessellationShader = false,
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
-      .multiDrawIndirect = true,
+      /* Bifrost JM can only run a single indirect draw (drawCount == 1). */
+      .multiDrawIndirect = PAN_ARCH >= 9,
       /* Valhall/JM resolves indirect draws on the CPU at submit time and
        * can't rebuild the per-instance attribute offsets that depend on
        * firstInstance, so don't promise it there. */
       .drawIndirectFirstInstance = PAN_ARCH != 9,
       .depthClamp = true,
       .depthBiasClamp = true,
-      /*
-       * Valhall can rasterize point and line primitives.  Zink uses this
-       * feature as its desktop-GL capability gate; keep the feature exposed
-       * on the kbase path so applications which only use filled polygons do
-       * not get rejected during device selection.  Polygon-mode lowering is
-       * handled separately from the native point/line topology path.
-       */
-      .fillModeNonSolid = true,
+      /* The hardware has no polygon mode and nothing in the driver lowers
+       * VK_POLYGON_MODE_LINE/POINT (extendedDynamicState3PolygonMode is off
+       * too): triangles were silently drawn filled. Native point/line
+       * *topologies* are unaffected by this feature. */
+      .fillModeNonSolid = false,
       .depthBounds = false,
       .wideLines = true,
       .largePoints = true,
       .alphaToOne = false,
-      .multiViewport = true,
+      /* maxViewports is 1 and the viewport index output isn't handled. */
+      .multiViewport = false,
       .samplerAnisotropy = true,
       .textureCompressionETC2 = has_texture_compression_etc2(device),
       .textureCompressionASTC_LDR = has_texture_compression_astc_ldr(device),
@@ -352,8 +364,9 @@ panvk_per_arch(get_physical_device_features)(
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
-      .shaderClipDistance = true,
-      .shaderCullDistance = true,
+      /* maxClipDistances/maxCullDistances are 0: no HW/compiler support. */
+      .shaderClipDistance = false,
+      .shaderCullDistance = false,
       .shaderFloat64 = true,
       .shaderInt64 = true,
       .shaderInt16 = true,
@@ -584,11 +597,11 @@ panvk_per_arch(get_physical_device_features)(
       .indirectMemoryCopy = PAN_ARCH >= 9,
 
       /* VK_EXT_conditional_rendering */
-      .conditionalRendering = PAN_ARCH >= 9,
-      .inheritedConditionalRendering = PAN_ARCH >= 9,
+      .conditionalRendering = PAN_ARCH >= 10,
+      .inheritedConditionalRendering = PAN_ARCH >= 10,
 
       /* VK_EXT_transform_feedback */
-      .transformFeedback = true,
+      .transformFeedback = PAN_ARCH >= 10,
       .geometryStreams = false,
 
       /* VK_EXT_custom_border_color */
@@ -937,7 +950,12 @@ panvk_per_arch(get_physical_device_properties)(
       .maxFragmentInputComponents = 128,
       /* 8 render targets. */
       .maxFragmentOutputAttachments = MAX_RTS,
-      .maxFragmentDualSrcAttachments = max_cbuf_atts,
+      /* Dual-source blending only works on render target 0 (the blend shader
+       * pairs the FS's index-0 and index-1 outputs of a single RT); claiming
+       * one dual-source attachment per color attachment made apps (and the
+       * PanProbe blend test) build dual-source blends on RT1..7, which the
+       * job manager rejects with DATA_INVALID_FAULT. */
+      .maxFragmentDualSrcAttachments = 1,
       /* 8 render targets, 2^12 storage buffers and 2^8 storage images (see
        * above).
        */
@@ -966,7 +984,11 @@ panvk_per_arch(get_physical_device_properties)(
       .mipmapPrecisionBits = 8,
       /* Software limit. */
       .maxDrawIndexedIndexValue = UINT32_MAX,
-      .maxDrawIndirectCount = PAN_ARCH >= 10 ? UINT32_MAX : 1,
+      /* On v9 every possible draw of an indirect(-count) command is recorded
+       * as a job, so keep the limit at the minimum the spec requires when
+       * multiDrawIndirect is supported. */
+      .maxDrawIndirectCount =
+         PAN_ARCH >= 10 ? UINT32_MAX : (PAN_ARCH == 9 ? 65535 : 1),
       .maxSamplerLodBias = (float)INT16_MAX / 256.0f,
       .maxSamplerAnisotropy = 16,
       .maxViewports = 1,
@@ -1293,16 +1315,16 @@ panvk_per_arch(get_physical_device_properties)(
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
 
       /* VK_EXT_transform_feedback */
-      .maxTransformFeedbackStreams = 1,
-      .maxTransformFeedbackBuffers = PANVK_MAX_XFB_BUFFERS,
-      .maxTransformFeedbackBufferSize = UINT32_MAX,
-      .maxTransformFeedbackStreamDataSize = 2048,
-      .maxTransformFeedbackBufferDataSize = 512,
-      .maxTransformFeedbackBufferDataStride = 2048,
-      .transformFeedbackQueries = true,
-      .transformFeedbackStreamsLinesTriangles = true,
-      .transformFeedbackRasterizationStreamSelect = true,
-      .transformFeedbackDraw = true,
+      .maxTransformFeedbackStreams = PAN_ARCH >= 10 ? 1 : 0,
+      .maxTransformFeedbackBuffers = PAN_ARCH >= 10 ? PANVK_MAX_XFB_BUFFERS : 0,
+      .maxTransformFeedbackBufferSize = PAN_ARCH >= 10 ? UINT32_MAX : 0,
+      .maxTransformFeedbackStreamDataSize = PAN_ARCH >= 10 ? 2048 : 0,
+      .maxTransformFeedbackBufferDataSize = PAN_ARCH >= 10 ? 512 : 0,
+      .maxTransformFeedbackBufferDataStride = PAN_ARCH >= 10 ? 2048 : 0,
+      .transformFeedbackQueries = PAN_ARCH >= 10,
+      .transformFeedbackStreamsLinesTriangles = PAN_ARCH >= 10,
+      .transformFeedbackRasterizationStreamSelect = PAN_ARCH >= 10,
+      .transformFeedbackDraw = PAN_ARCH >= 10,
 
       /* VK_EXT_shader_tile_image */
       .shaderTileImageCoherentReadAccelerated = PAN_ARCH >= 9,
