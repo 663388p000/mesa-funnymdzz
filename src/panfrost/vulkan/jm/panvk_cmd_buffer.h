@@ -63,6 +63,13 @@ struct panvk_jm_indirect_fixup {
    struct panvk_buffer *buffer;
    uint64_t offset;
 
+   /* vkCmdDraw*IndirectCount: maxDrawCount placeholder draws are recorded;
+    * the one at count_index only runs if the 32-bit count stored in
+    * count_buffer (read back at submit time) is greater than count_index. */
+   struct panvk_buffer *count_buffer;
+   uint64_t count_offset;
+   uint32_t count_index;
+
    void *job;               /* job descriptor, CPU pointer */
    uint32_t type_xor[8];    /* flips the header job type NULL <-> real type */
    bool enabled;            /* header currently holds the real type */
