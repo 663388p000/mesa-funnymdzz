@@ -459,6 +459,11 @@ struct panvk_draw_info {
        * (and only needed) by the Valhall/JM backend. */
       struct panvk_buffer *buffer;
       uint64_t offset;
+      /* Valhall/JM vkCmdDraw*IndirectCount: the count buffer, and the position
+       * of this (placeholder) draw in the multi-draw. */
+      struct panvk_buffer *count_buffer;
+      uint64_t count_offset;
+      uint32_t count_index;
    } indirect;
 
    enum mesa_prim prim;
