@@ -1377,6 +1377,22 @@ panvk_compile_shader(struct panvk_device *dev,
    struct panvk_shader *shader;
    VkResult result;
 
+   /* Geometry and tessellation shaders aren't supported (neither is
+    * advertised). If an application feeds one in anyway, fail cleanly here
+    * instead of letting the stage fall through to UNREACHABLE() -- in a
+    * release build that is undefined behaviour and ended up handing the GS/TCS
+    * NIR to the Bifrost back-end, which dies on 'Unhandled intrinsic
+    * load_per_vertex_input'. */
+   switch (info->stage) {
+   case MESA_SHADER_VERTEX:
+   case MESA_SHADER_FRAGMENT:
+   case MESA_SHADER_COMPUTE:
+   case MESA_SHADER_KERNEL:
+      break;
+   default:
+      return panvk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
+
    size_t size =
       sizeof(struct panvk_shader) + sizeof(struct panvk_shader_variant) *
                                        panvk_shader_num_variants(info->stage);
