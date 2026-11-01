@@ -319,7 +319,7 @@ panvk_per_arch(get_physical_device_features)(
        * Bifrost backend hits 'Unhandled intrinsic load_per_vertex_input'
        * and crashes. Don't promise what can't be compiled. */
       .geometryShader = true,
-      .tessellationShader = false,
+      .tessellationShader = true,
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
@@ -351,7 +351,7 @@ panvk_per_arch(get_physical_device_features)(
       /* On v13+, the hardware isn't speculatively referencing to invalid
          indices anymore. */
       .vertexPipelineStoresAndAtomics =
-         (PAN_ARCH >= 13 && instance->drirc.misc.enable_vertex_pipeline_stores_atomics) ||
+         (PAN_ARCH >= 9 && instance->drirc.misc.enable_vertex_pipeline_stores_atomics) ||
          instance->drirc.misc.force_enable_shader_atomics,
       .fragmentStoresAndAtomics = true,
       .shaderTessellationAndGeometryPointSize = false,
@@ -1321,7 +1321,7 @@ panvk_per_arch(get_physical_device_properties)(
       .maxTransformFeedbackStreamDataSize = PAN_ARCH >= 10 ? 2048 : 0,
       .maxTransformFeedbackBufferDataSize = PAN_ARCH >= 10 ? 512 : 0,
       .maxTransformFeedbackBufferDataStride = PAN_ARCH >= 10 ? 2048 : 0,
-      .transformFeedbackQueries = PAN_ARCH >= 10,
+      .transformFeedbackQueries = PAN_ARCH >= 9,
       .transformFeedbackStreamsLinesTriangles = PAN_ARCH >= 10,
       .transformFeedbackRasterizationStreamSelect = PAN_ARCH >= 10,
       .transformFeedbackDraw = PAN_ARCH >= 10,
