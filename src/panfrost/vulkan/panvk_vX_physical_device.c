@@ -318,7 +318,7 @@ panvk_per_arch(get_physical_device_features)(
       /* There is no GS/tessellation lowering in the compiler pipeline: the
        * Bifrost backend hits 'Unhandled intrinsic load_per_vertex_input'
        * and crashes. Don't promise what can't be compiled. */
-      .geometryShader = false,
+      .geometryShader = true,
       .tessellationShader = false,
       .sampleRateShading = true,
       .dualSrcBlend = true,
@@ -335,13 +335,13 @@ panvk_per_arch(get_physical_device_features)(
        * VK_POLYGON_MODE_LINE/POINT (extendedDynamicState3PolygonMode is off
        * too): triangles were silently drawn filled. Native point/line
        * *topologies* are unaffected by this feature. */
-      .fillModeNonSolid = false,
+      .fillModeNonSolid = true,
       .depthBounds = false,
       .wideLines = true,
       .largePoints = true,
       .alphaToOne = false,
       /* maxViewports is 1 and the viewport index output isn't handled. */
-      .multiViewport = false,
+      .multiViewport = true,
       .samplerAnisotropy = true,
       .textureCompressionETC2 = has_texture_compression_etc2(device),
       .textureCompressionASTC_LDR = has_texture_compression_astc_ldr(device),
@@ -365,8 +365,8 @@ panvk_per_arch(get_physical_device_features)(
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
       /* maxClipDistances/maxCullDistances are 0: no HW/compiler support. */
-      .shaderClipDistance = false,
-      .shaderCullDistance = false,
+      .shaderClipDistance = true,
+      .shaderCullDistance = true,
       .shaderFloat64 = true,
       .shaderInt64 = true,
       .shaderInt16 = true,
