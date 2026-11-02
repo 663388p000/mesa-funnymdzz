@@ -428,73 +428,8 @@ panvk_android_allocate_ahb_memory(VkDevice device,
    return VK_SUCCESS;
 }
 
-/* Android hwvulkan HAL.
- *
- * The system Vulkan loader (libvulkan.so) only talks to a driver through the
- * hwvulkan HAL: it dlsym()s HAL_MODULE_INFO_SYM ("HMI") in the library and
- * opens the "vk0" device to get vkCreateInstance & co. Anything that swaps
- * the vendor driver for a custom one by going through that loader -- most
- * notably libadrenotools, which is what Winlator / GameNative / Ludashi and
- * their Vulkan wrappers use -- therefore needs the driver to export it.
- *
- * Without it the loader logs that it can't use the HAL, falls back to its
- * stub HAL (zero physical devices) or to the vendor driver, and the custom
- * driver "doesn't load" even though a plain dlopen() +
- * vk_icdGetInstanceProcAddr() works (that is how an app like PanProbe loads
- * it, which is why the same .so looked fine there).
+/* The hwvulkan HAL entry point (HAL_MODULE_INFO_SYM, i.e. the "HMI" symbol)
+ * is provided by the common runtime (src/vulkan/runtime/vk_android.c). Do not
+ * define it again in the driver, otherwise libvulkan_panfrost.so fails to link
+ * with "duplicate symbol: HMI".
  */
-_Static_assert(HWVULKAN_DISPATCH_MAGIC == ICD_LOADER_MAGIC,
-               "hwvulkan and ICD dispatch magics must match");
-
-static int panvk_hal_open(const struct hw_module_t *mod, const char *id,
-                          struct hw_device_t **dev);
-static int panvk_hal_close(struct hw_device_t *dev);
-
-PUBLIC struct hwvulkan_module_t HAL_MODULE_INFO_SYM = {
-   .common = {
-      .tag = HARDWARE_MODULE_TAG,
-      .module_api_version = HWVULKAN_MODULE_API_VERSION_0_1,
-      .hal_api_version = HARDWARE_MAKE_API_VERSION(1, 0),
-      .id = HWVULKAN_HARDWARE_MODULE_ID,
-      .name = "PanVK Vulkan HAL",
-      .author = "Mesa3D",
-      .methods = &(hw_module_methods_t) {
-         .open = panvk_hal_open,
-      },
-   },
-};
-
-static int
-panvk_hal_open(const struct hw_module_t *mod, const char *id,
-               struct hw_device_t **dev)
-{
-   assert(mod == &HAL_MODULE_INFO_SYM.common);
-   assert(strcmp(id, HWVULKAN_DEVICE_0) == 0);
-
-   hwvulkan_device_t *hal_dev = calloc(1, sizeof(*hal_dev));
-   if (!hal_dev)
-      return -1;
-
-   *hal_dev = (hwvulkan_device_t){
-      .common = {
-         .tag = HARDWARE_DEVICE_TAG,
-         .version = HWVULKAN_DEVICE_API_VERSION_0_1,
-         .module = &HAL_MODULE_INFO_SYM.common,
-         .close = panvk_hal_close,
-      },
-      .EnumerateInstanceExtensionProperties =
-         panvk_EnumerateInstanceExtensionProperties,
-      .CreateInstance = panvk_CreateInstance,
-      .GetInstanceProcAddr = panvk_GetInstanceProcAddr,
-   };
-
-   *dev = &hal_dev->common;
-   return 0;
-}
-
-static int
-panvk_hal_close(struct hw_device_t *dev)
-{
-   /* hwvulkan.h says hw_device_t::close() is never called. */
-   return -1;
-}
