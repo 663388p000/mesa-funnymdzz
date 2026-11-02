@@ -1,10 +1,26 @@
+# Version script for the Android build of the Mesa Vulkan driver
+# (libvulkan_panfrost.so).
+#
+# HMI
+#   Android's own loader (libvulkan.so -> hw_get_module() -> dlsym("HMI"))
+#   looks for this symbol. It is HAL_MODULE_INFO_SYM, an instance of
+#   struct hwvulkan_module_t, defined in src/vulkan/runtime/vk_android.c.
+#   If it is demoted to local here, nothing references it any more and
+#   --gc-sections drops it from the .so altogether, so the HAL "doesn't load".
+#
+# vk_icd*
+#   Khronos loader <-> ICD interface (vk_icdGetInstanceProcAddr,
+#   vk_icdNegotiateLoaderICDInterfaceVersion, vk_icdGetPhysicalDeviceProcAddr)
+#   for dlopen() users such as PanProbe or the Termux loader. Written as a
+#   wildcard on purpose: lld >= 16 rejects exact names that are not defined,
+#   a wildcard that matches nothing is fine.
 {
-	global:
-		HMI;
-		vk_icdGetInstanceProcAddr;
+global:
+        vk_icdGetInstanceProcAddr;
 		vk_icdNegotiateLoaderICDInterfaceVersion;
 		vk_icdGetPhysicalDeviceProcAddr;
-
-	local:
-		*;
+    HMI;
+    vk_icd*;
+local:
+    *;
 };
