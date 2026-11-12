@@ -3400,3 +3400,56 @@ panvk_per_arch(CmdEndRendering)(VkCommandBuffer commandBuffer)
 }
 
 #endif /* PAN_ARCH >= 9 */
+
+/* VK_EXT_multi_draw. Every draw is its own job on the Job Manager anyway, so
+ * the "batching" this extension allows boils down to looping over the regular
+ * single-draw entrypoints (which are defined above for all JM archs). */
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawMultiEXT)(VkCommandBuffer commandBuffer,
+                                uint32_t drawCount,
+                                const VkMultiDrawInfoEXT *pVertexInfo,
+                                uint32_t instanceCount, uint32_t firstInstance,
+                                uint32_t stride)
+{
+   if (!drawCount || !pVertexInfo)
+      return;
+
+   if (!stride)
+      stride = sizeof(VkMultiDrawInfoEXT);
+
+   const uint8_t *cur = (const uint8_t *)pVertexInfo;
+   for (uint32_t i = 0; i < drawCount; i++, cur += stride) {
+      const VkMultiDrawInfoEXT *info = (const VkMultiDrawInfoEXT *)cur;
+
+      panvk_per_arch(CmdDraw)(commandBuffer, info->vertexCount, instanceCount,
+                              info->firstVertex, firstInstance);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawMultiIndexedEXT)(VkCommandBuffer commandBuffer,
+                                       uint32_t drawCount,
+                                       const VkMultiDrawIndexedInfoEXT *pIndexInfo,
+                                       uint32_t instanceCount,
+                                       uint32_t firstInstance, uint32_t stride,
+                                       const int32_t *pVertexOffset)
+{
+   if (!drawCount || !pIndexInfo)
+      return;
+
+   if (!stride)
+      stride = sizeof(VkMultiDrawIndexedInfoEXT);
+
+   const uint8_t *cur = (const uint8_t *)pIndexInfo;
+   for (uint32_t i = 0; i < drawCount; i++, cur += stride) {
+      const VkMultiDrawIndexedInfoEXT *info =
+         (const VkMultiDrawIndexedInfoEXT *)cur;
+      /* When pVertexOffset is provided it replaces every per-draw offset. */
+      const int32_t vertex_offset =
+         pVertexOffset ? *pVertexOffset : info->vertexOffset;
+
+      panvk_per_arch(CmdDrawIndexed)(commandBuffer, info->indexCount,
+                                     instanceCount, info->firstIndex,
+                                     vertex_offset, firstInstance);
+   }
+}
