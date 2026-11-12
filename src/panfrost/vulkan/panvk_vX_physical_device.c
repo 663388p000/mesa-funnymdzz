@@ -199,6 +199,12 @@ panvk_per_arch(get_physical_device_extensions)(
 	  .EXT_present_timing =
          device->kmod.dev->props.gpu_can_query_timestamp,
 #endif
+      /* Implemented by the JM backends (v6/v7/v9) as a loop of single draws. */
+      /* Priorities are only allocation hints and the kbase backend has no
+       * residency/eviction control (UMA, no dedicated VRAM), so
+       * VkMemoryPriorityAllocateInfoEXT is accepted and ignored. */
+      .EXT_memory_priority = true,
+      .EXT_multi_draw = PAN_ARCH < 10,
       .EXT_private_data = true,
       .EXT_primitive_topology_list_restart = true,
       .EXT_provoking_vertex = true,
@@ -511,6 +517,12 @@ panvk_per_arch(get_physical_device_features)(
 
       /* VK_KHR_maintenance9 */
       .maintenance9 = true,
+
+      /* VK_EXT_multi_draw */
+      .multiDraw = PAN_ARCH < 10,
+
+      /* VK_EXT_memory_priority */
+      .memoryPriority = true,
 
       /* VK_KHR_internally_synchronized_queues */
       .internallySynchronizedQueues = true,
@@ -1285,6 +1297,9 @@ panvk_per_arch(get_physical_device_properties)(
       /* Sparse binding not supported yet. */
       .image2DViewOf3DSparse = false,
       .defaultVertexAttributeValue = VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ZERO_KHR,
+
+      /* VK_EXT_multi_draw */
+      .maxMultiDrawCount = 2048,
 
       /* VK_EXT_conservative_rasterization */
       .primitiveOverestimationSize = 1.0f / 512.0f,
